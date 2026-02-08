@@ -108,6 +108,18 @@ class StorageEngine:
         pr = ranges[locator.page_range_id]
         return pr.read_row(locator.offset)
 
+    def overwrite_values_at(self, locator: RecordLocator, col_indices: List[int], values: List[int]) -> None:
+        #四次修 同一行更新多列时只算一次 page_index/in_page_offset，然后批量覆盖写
+        ranges = self._storage.tail_ranges if locator.is_tail else self._storage.base_ranges
+        pr = ranges[locator.page_range_id]
+        page_index = locator.offset // Page.CAPACITY
+        in_page_offset = locator.offset % Page.CAPACITY
+        pages_by_col = pr.pages_by_col  # 缓存
+        for c, v in zip(col_indices, values):
+            if v is None:
+                v = 0
+            # 直接覆盖 list[int]，避免额外调用开销
+            pages_by_col[c][page_index].data[in_page_offset] = int(v)
 
 
 class Table:
