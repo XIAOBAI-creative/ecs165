@@ -57,8 +57,14 @@ class PageRange:
         self._ensure_capacity_for_next_row()
         # 逐列写入最后一页
         pages_by_col = self.pages_by_col  # 缓存一下能快点
+
+        # 五次修改：别再调用 Page.write()（函数调用 + 边界检查太慢）
+        # 这里已经 _ensure_capacity_for_next_row() 保证有容量了，直接 append + num_records++
         for c in range(self.total_columns):
-            pages_by_col[c][-1].write(values[c])
+            p = pages_by_col[c][-1]
+            p.data.append(values[c])
+            p.num_records += 1
+
         row_offset = self.num_rows
         self.num_rows += 1
         return row_offset
@@ -76,12 +82,13 @@ class PageRange:
         total_cols = self.total_columns
         # 预分配 list，这样append开销能少点
         result = [0] * total_cols
+
+        # 五次修改：别再调用 Page.read()（函数调用 + 边界检查太慢）
+        # row_offset 的合法性已检查，page_index 也会随着写入同步增长，直接取 data 即可
         for c in range(total_cols):
             page_list = pages_by_col[c]
-            #保留一下保护吧
-            if page_index >= len(page_list):
-                raise IndexError("Page index out of range in column")
-            result[c] = page_list[page_index].read(in_page_offset)
+            result[c] = page_list[page_index].data[in_page_offset]
+
         return result
 
 
