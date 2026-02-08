@@ -126,11 +126,8 @@ class Table:
         self.page_directory: Dict[int, RecordLocator] = {}
         #默认对 key列弄索引
         self.index = Index(self)
-        # 
-        +++++++++++++++++++++++
-        之前merge_threshold_pages同名方法会被这个 int 覆盖导致int不能被调用，以后千万别这么搞，不然milestone2肯定不过测试
-        +++++++++++++++++++
-        self.merge_threshold_pages = 50
+        #  +++++++++++++++++++++++之前merge_threshold_pages同名方法会被这个 int 覆盖导致int不能被调用，以后千万别这么搞，不然milestone2肯定不过测试
+        self.merge_threshold_pages_count = 50#命名改了
         #rid的分配，base 从小到大，tail用大数省的冲突
         self._next_base_rid = 1
         self._next_tail_rid = 10_000_000
@@ -141,7 +138,7 @@ class Table:
         print("merge is happening")
         pass
 
-    def merge_threshold_pages(self):
+    def new_merge_threshold_pages(self):#命名改了
         print("merge_threshold_pages is happening")
         pass
 
