@@ -15,6 +15,8 @@ class Query:
         self._num_cols = table.num_columns
         # 五次修改：用 bitmask 表示“全列有效”，tail 存全量快照时直接用它
         self._all_ones = (1 << table.num_columns) - 1
+        # 五次修改：预计算每列对应的 bit（避免 update 里反复 shift）
+        self._col_bits = [1 << (table.num_columns - 1 - i) for i in range(table.num_columns)]
 
 
     """
@@ -48,14 +50,15 @@ class Query:
         try:
             schema_encoding = 0
             rid = self.table.alloc_base_rid()
-            timestamp = int(time())
+            # 五次修改：不用 time()，用自增 timestamp
+            timestamp = self.table.next_timestamp()
             indirection = 0  # No tail record yet
 
             # Build full record: [indirection, rid, timestamp, schema_encoding, ...user_columns]
             full_record = [indirection, rid, timestamp, schema_encoding] + list(columns)
 
-            # Write to storage
-            self.table.write_record(is_tail=False, rid=rid, columns=full_record)
+            # 五次修改：insert 也是纯 int，可直接 fast 写（绕过 norm 扫描）
+            self.table.write_record_fast(is_tail=False, rid=rid, columns=full_record)
 
             # Update index for primary key
             primary_key = columns[self.table.key]
@@ -228,7 +231,8 @@ class Query:
             old_indirection = base_row[INDIRECTION_COLUMN]
 
             num_cols = self._num_cols
-            timestamp = int(time())
+            # 五次修改：不用 time()，用自增 timestamp（update 会被测很多次）
+            timestamp = self.table.next_timestamp()
 
             # 五次修改：取“当前最新行”作为快照源（第一次 update 用 base，否则用最新 tail）
             if old_indirection == 0:
@@ -237,24 +241,31 @@ class Query:
                 tail_locator = lookup(old_indirection)
                 src_row = storage.read_record(tail_locator) if tail_locator is not None else base_row
 
-            # Build schema encoding and new values（new tail 存全量快照）
-            updated_bits = 0
-            new_user_values = [0] * num_cols
+            # 五次修改：先直接复制最新快照（切片复制），然后只改需要更新的列
             base_idx = 4
+            new_user_values = src_row[base_idx:base_idx + num_cols].copy()
+
+            updated_bits = 0
+            col_bits = self._col_bits
             for i in range(num_cols):
                 v = columns[i]
                 if v is not None:
-                    updated_bits |= (1 << (num_cols - 1 - i))
+                    updated_bits |= col_bits[i]
                     new_user_values[i] = v
-                else:
-                    new_user_values[i] = src_row[base_idx + i]
 
-            # 五次修改：只写 1 条 tail（全量快照），tail.indirection 指向上一条 tail（第一次就是 0）
+            # 五次修改：预分配 tail_record，避免 list 拼接
             tail_rid = self.table.alloc_tail_rid()
-            tail_record = [old_indirection, tail_rid, timestamp, self._all_ones] + new_user_values
-            self.table.write_record(is_tail=True, rid=tail_rid, columns=tail_record)
+            tail_record = [0] * (4 + num_cols)
+            tail_record[0] = old_indirection          # tail.indirection 指向上一条 tail（第一次就是 0）
+            tail_record[1] = tail_rid
+            tail_record[2] = timestamp
+            tail_record[3] = self._all_ones           # tail 存全量快照
+            tail_record[4:] = new_user_values
 
-            # 五次修改：base 只覆盖写 2 个 int（indirection + schema），不再覆盖写用户列（update 速度会大幅下降开销）
+            # 五次修改：fast 写入，绕开 norm/int/None 扫描（update 最主要提速点之一）
+            self.table.write_record_fast(is_tail=True, rid=tail_rid, columns=tail_record)
+
+            # 五次修改：base 只覆盖写 2 个 int（indirection + schema）
             new_base_schema = base_row[SCHEMA_ENCODING_COLUMN] | updated_bits
             self.table.overwrite_values_at(
                 base_locator,
