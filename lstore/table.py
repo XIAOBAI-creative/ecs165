@@ -108,18 +108,6 @@ class StorageEngine:
         pr = ranges[locator.page_range_id]
         return pr.read_row(locator.offset)
 
-    def overwrite_values_at(self, locator: RecordLocator, col_indices: List[int], values: List[int]) -> None:
-        #四次修 同一行更新多列时只算一次 page_index/in_page_offset，然后批量覆盖写
-        ranges = self._storage.tail_ranges if locator.is_tail else self._storage.base_ranges
-        pr = ranges[locator.page_range_id]
-        page_index = locator.offset // Page.CAPACITY
-        in_page_offset = locator.offset % Page.CAPACITY
-        pages_by_col = pr.pages_by_col  # 缓存
-        for c, v in zip(col_indices, values):
-            if v is None:
-                v = 0
-            # 直接覆盖 list[int]，避免额外调用开销
-            pages_by_col[c][page_index].data[in_page_offset] = int(v)
 
 
 class Table:
@@ -197,10 +185,27 @@ class Table:
         return out
 
     def overwrite_value_at(self, locator: RecordLocator, column_index: int, value: int) -> None:
-        # （二次修改）统一按 locator 覆盖写，别在 Query里pages_by_col + struct
+        #五次修改 统一按 locator 覆盖写，别在 Query 里pages_by_col
         ranges = self._storage.tail_ranges if locator.is_tail else self._storage.base_ranges
         pr = ranges[locator.page_range_id]
         page_index = locator.offset // Page.CAPACITY
         in_page_offset = locator.offset % Page.CAPACITY
 
-        pr.pages_by_col[column_index][page_index].overwrite(in_page_offset, value)
+        #五次修改 直接覆盖 list[int]，不struct/bytes
+        if value is None:
+            value = 0
+        pr.pages_by_col[column_index][page_index].data[in_page_offset] = int(value)
+
+    def overwrite_values_at(self, locator: RecordLocator, col_indices: List[int], values: List[int]) -> None:
+        #五次修改 批量覆盖写：同一行多列更新时只算一次 page_index/in_page_offset
+        ranges = self._storage.tail_ranges if locator.is_tail else self._storage.base_ranges
+        pr = ranges[locator.page_range_id]
+
+        page_index = locator.offset // Page.CAPACITY
+        in_page_offset = locator.offset % Page.CAPACITY
+
+        pages_by_col = pr.pages_by_col  # 缓存
+        for c, v in zip(col_indices, values):
+            if v is None:
+                v = 0
+            pages_by_col[c][page_index].data[in_page_offset] = int(v)
