@@ -33,7 +33,7 @@ class Page:
         return self.data[offset]
 
     def overwrite(self, offset: int, value: int) -> None:
-        # 【新增】支持覆盖写（update base 的 indirection / schema encoding 必须）
+        # （二次修改）覆盖写（update base 的 indirection / schema encoding 必须）
         if offset < 0 or offset >= self.num_records:
             raise IndexError("Offset out of range in Page")
         if value is None:
