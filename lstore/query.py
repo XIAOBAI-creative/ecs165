@@ -1,4 +1,5 @@
-from lstore.table import Record, INDIRECTION_COLUMN, RID_COLUMN, TIMESTAMP_COLUMN, SCHEMA_ENCODING_COLUMN
+from lstore.table import Table, Record, INDIRECTION_COLUMN, RID_COLUMN, TIMESTAMP_COLUMN, SCHEMA_ENCODING_COLUMN  
+from lstore.index import Index
 from time import time
 
 
@@ -11,6 +12,9 @@ class Query:
     """
     def __init__(self, table):
         self.table = table
+        self._num_cols = table.num_columns
+        self._user_col_indices = list(range(4, 4 + table.num_columns))
+        self._all_ones = (1 << table.num_columns) - 1
 
 
     """
@@ -80,7 +84,7 @@ class Query:
             # 缓存常用的东西，少做属性查找
             lookup = self.table.lookup_locator
             storage = self.table._storage
-            num_cols = self.table.num_columns
+            num_cols = self._num_cols
             key_col = self.table.key
 
             results = []
@@ -90,10 +94,9 @@ class Query:
                     continue
 
                 base_row = storage.read_record(locator)
-
-                #四次修  update把 base 的用户列覆盖成最新：select 永远直接读base，不管tail
                 user_columns = base_row[4:]
 
+                # Apply projection
                 projected = [None] * num_cols
                 for i, keep in enumerate(projected_columns_index):
                     if keep:
@@ -124,7 +127,7 @@ class Query:
             if not rids:
                 return []
 
-            num_cols = self.table.num_columns
+            num_cols = self._num_cols
             key_col = self.table.key
 
             results = []
@@ -160,10 +163,9 @@ class Query:
 
         base_row = storage.read_record(locator)
         indirection = base_row[INDIRECTION_COLUMN]
+
         if indirection == 0:
             return list(base_row[4:])
-
-        #四次修改 直接走链第 k 条 tail，返回那条的快照
         k = abs(relative_version)
         current_rid = indirection
         last_tail_row = None
@@ -208,10 +210,8 @@ class Query:
             base_row = storage.read_record(base_locator)
             old_indirection = base_row[INDIRECTION_COLUMN]
 
-            num_cols = self.table.num_columns
+            num_cols = self._num_cols
             timestamp = int(time())
-
-            #四次修改 base现在是最新，所以 current_values 直接取 base 的用户列，不管tail
             current_values = base_row[4:]
 
             schema_bits = 0
@@ -224,12 +224,10 @@ class Query:
                 else:
                     new_user_values[i] = current_values[i]
 
-            # 四次修 第一次 update先写原始 base 快照 tail，这样旧版本不丢
             prev_rid = old_indirection
             if old_indirection == 0:
                 snapshot_rid = self.table.alloc_tail_rid()
-                all_ones = (1 << num_cols) - 1
-                snapshot_record = [0, snapshot_rid, timestamp, all_ones] + list(current_values)
+                snapshot_record = [0, snapshot_rid, timestamp, self._all_ones] + list(current_values)
                 self.table.write_record(is_tail=True, rid=snapshot_rid, columns=snapshot_record)
                 prev_rid = snapshot_rid
 
@@ -237,18 +235,13 @@ class Query:
             tail_rid = self.table.alloc_tail_rid()
             tail_record = [prev_rid, tail_rid, timestamp, schema_bits] + new_user_values
             self.table.write_record(is_tail=True, rid=tail_rid, columns=tail_record)
-
-            #四次修改 用 table.overwrite_values_at批量覆盖，减少函数调用和重复算偏移
             new_base_schema = base_row[SCHEMA_ENCODING_COLUMN] | schema_bits
             self.table.overwrite_values_at(
                 base_locator,
                 [INDIRECTION_COLUMN, SCHEMA_ENCODING_COLUMN],
                 [tail_rid, new_base_schema]
             )
-
-            #四次修改 批量覆盖 base 的用户列成最新，select/sum 直接读 base
-            user_col_indices = list(range(4, 4 + num_cols))
-            self.table.overwrite_values_at(base_locator, user_col_indices, new_user_values)
+            self.table.overwrite_values_at(base_locator, self._user_col_indices, new_user_values)
 
             return True
         except:
@@ -274,8 +267,6 @@ class Query:
 
             total = 0
             col = 4 + aggregate_column_index
-
-            #四次修改 base 永远最新sum 只读 base 一次
             for rid in rids:
                 locator = lookup(rid)
                 if locator is None:
