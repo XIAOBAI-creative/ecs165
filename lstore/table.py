@@ -57,14 +57,8 @@ class PageRange:
         self._ensure_capacity_for_next_row()
         # 逐列写入最后一页
         pages_by_col = self.pages_by_col  # 缓存一下能快点
-
-        # 五次修改：别再调用 Page.write()（函数调用 + 边界检查太慢）
-        # 这里已经 _ensure_capacity_for_next_row() 保证有容量了，直接 append + num_records++
         for c in range(self.total_columns):
-            p = pages_by_col[c][-1]
-            p.data.append(values[c])
-            p.num_records += 1
-
+            pages_by_col[c][-1].write(values[c])
         row_offset = self.num_rows
         self.num_rows += 1
         return row_offset
@@ -82,13 +76,12 @@ class PageRange:
         total_cols = self.total_columns
         # 预分配 list，这样append开销能少点
         result = [0] * total_cols
-
-        # 五次修改：别再调用 Page.read()（函数调用 + 边界检查太慢）
-        # row_offset 的合法性已检查，page_index 也会随着写入同步增长，直接取 data 即可
         for c in range(total_cols):
             page_list = pages_by_col[c]
-            result[c] = page_list[page_index].data[in_page_offset]
-
+            #保留一下保护吧
+            if page_index >= len(page_list):
+                raise IndexError("Page index out of range in column")
+            result[c] = page_list[page_index].read(in_page_offset)
         return result
 
 
@@ -141,6 +134,9 @@ class Table:
         # 存储
         self._storage = StorageEngine(self.total_columns)
 
+        # 五次修改：用自增 timestamp 代替 time() 系统调用（系统调用慢，update 会被放大）
+        self._ts_counter = 1
+
     def __merge(self):
         print("merge is happening")
         pass
@@ -161,6 +157,12 @@ class Table:
         self._next_tail_rid += 1
         return rid
 
+# 五次修改：给 Query 用的超快 timestamp（避免 time()）
+    def next_timestamp(self) -> int:
+        ts = self._ts_counter
+        self._ts_counter = ts + 1
+        return ts
+
 # return the record by the given RID
     def lookup_locator(self, rid: int) -> Optional[RecordLocator]:
         return self.page_directory.get(rid, None)
@@ -178,6 +180,14 @@ class Table:
         self.install_locator(rid, locator)
         return locator
 
+# 五次修改：超快写入（跳过 norm/int/None 扫描），update 最主要的提速点就在这里
+    def write_record_fast(self, is_tail: bool, rid: int, columns: List[int]) -> RecordLocator:
+        if len(columns) != self.total_columns:
+            raise ValueError(f"columns length {len(columns)} != total_columns {self.total_columns}")
+        locator = self._storage.append_record(is_tail=is_tail, values=columns)
+        self.install_locator(rid, locator)
+        return locator
+
 # return the record columns by the given locator
     def read_record(self, locator: RecordLocator, projected_cols: Optional[List[int]] = None) -> List[int]:
         row = self._storage.read_record(locator)
@@ -192,9 +202,11 @@ class Table:
         return out
 
     def overwrite_value_at(self, locator: RecordLocator, column_index: int, value: int) -> None:
-        #五次修改 统一按 locator 覆盖写，别在 Query 里pages_by_col
+        #五次修改 统一按 locator 覆盖写，别在 Query 里手搓 pages_by_col + struct
         ranges = self._storage.tail_ranges if locator.is_tail else self._storage.base_ranges
         pr = ranges[locator.page_range_id]
+
+        #五次修改 不要写死 512，用 Page.CAPACITY
         page_index = locator.offset // Page.CAPACITY
         in_page_offset = locator.offset % Page.CAPACITY
 
