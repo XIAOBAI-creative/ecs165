@@ -1,7 +1,6 @@
-from lstore.table import Table, Record, INDIRECTION_COLUMN, RID_COLUMN, TIMESTAMP_COLUMN, SCHEMA_ENCODING_COLUMN
+from lstore.table import Table, Record, INDIRECTION_COLUMN, RID_COLUMN, TIMESTAMP_COLUMN, SCHEMA_ENCODING_COLUMN  
 from lstore.index import Index
 from time import time
-import struct
 
 
 class Query:
@@ -88,6 +87,7 @@ class Query:
         tail_row = self.table._storage.read_record(tail_locator)
         return list(tail_row[4:])
 
+
     """
     # Read matching record with specified search key
     # :param search_key: the value you want to search based on
@@ -164,6 +164,7 @@ class Query:
             return results
         except:
             return False
+
 
     def _get_version_values(self, base_rid: int, relative_version: int):
         """
@@ -253,11 +254,8 @@ class Query:
             tail_rid = self.table.alloc_tail_rid()
             timestamp = int(time())
 
-            # Tail's indirection points to previous version (old indirection or base RID if first update)
-            if old_indirection == 0:
-                tail_indirection = base_rid
-            else:
-                tail_indirection = old_indirection
+            # （二次修改）tail 的 indirection 永远指向上一条 tail（第一次为0）
+            tail_indirection = old_indirection
 
             # Build tail record
             tail_record = [tail_indirection, tail_rid, timestamp, schema_bits] + new_user_values
@@ -265,12 +263,13 @@ class Query:
             # Write tail record
             self.table.write_record(is_tail=True, rid=tail_rid, columns=tail_record)
 
-            # Update base record's indirection to point to new tail
-            base_page_range = self.table._storage.base_ranges[base_locator.page_range_id]
-            page_index = base_locator.offset // 512
-            in_page_offset = base_locator.offset % 512
-            start = in_page_offset * 8
-            base_page_range.pages_by_col[INDIRECTION_COLUMN][page_index].data[start:start + 8] = struct.pack("q", tail_rid)
+            # 【修改】Update base record's indirection to point to new tail
+            # 你 Page.data 是 list[int]，不能用 struct 往里塞 bytes；要用覆盖写
+            self.table.overwrite_value_at(base_locator, INDIRECTION_COLUMN, tail_rid)
+
+            # 【修改】base 的 schema encoding 要记录哪些列被更新过（OR 进去）
+            new_base_schema = base_row[SCHEMA_ENCODING_COLUMN] | schema_bits
+            self.table.overwrite_value_at(base_locator, SCHEMA_ENCODING_COLUMN, new_base_schema)
 
             return True
         except:
