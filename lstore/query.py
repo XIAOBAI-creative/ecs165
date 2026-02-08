@@ -206,30 +206,31 @@ class Query:
             # No updates at all, return base
             return list(base_user_columns)  #(erxiciugai)这里再copy
 
-        # 三次修改 update 里 new_user_values已经补全了 None，所以版本查询不需要 schema apply
-    #三次修改 直接从最新 tail 开始往后走 k 步，找到对应 tail，返回那条 tail 的 user columns
+        # 【三次修改】tail 是全列，查询直接走 indirection 链第 k 条 tail，不做 schema apply
         k = abs(relative_version)
         current_rid = indirection
+        last_tail_row = None  # 【三次修改】用于处理走到链尾（indirection=0）时返回最老快照
 
-        while k > 0 and current_rid != 0 and current_rid >= 10_000_000:
+        while current_rid != 0 and current_rid >= 10_000_000:
             tail_locator = lookup(current_rid)
             if tail_locator is None:
-                current_rid = 0
                 break
             tail_row = storage.read_record(tail_locator)
+            last_tail_row = tail_row
+
+            if k == 0:
+                # 找到目标版本（当前这条 tail）
+                return list(tail_row[4:])
+
             current_rid = tail_row[INDIRECTION_COLUMN]
             k -= 1
 
-        if current_rid == 0 or current_rid < 10_000_000:
-            # Asking for version before any updates, return base
-            return list(base_user_columns)
+        # 【三次修改】如果 k 还没走完就到链尾了，说明要的比最老 tail 还老：返回最老快照 tail（last_tail_row）
+        if last_tail_row is not None:
+            return list(last_tail_row[4:])
 
-        tail_locator = lookup(current_rid)
-        if tail_locator is None:
-            return list(base_user_columns)
-
-        tail_row = storage.read_record(tail_locator)
-        return list(tail_row[4:])
+        # 兜底：实在异常才回 base
+        return list(base_user_columns)
 
 
     """
@@ -267,24 +268,35 @@ class Query:
                 else:
                     new_user_values.append(current_values[i])
 
-            # Allocate tail RID
-            tail_rid = self.table.alloc_tail_rid()
             timestamp = int(time())
 
-            # （二次修改）tail 的 indirection 永远指向上一条 tail（第一次为0）
-            tail_indirection = old_indirection
+            # 【三次修改】第一次 update 时，先把“原始 base 快照”写成一条 tail，保证旧版本不丢
+            prev_rid = old_indirection
+            if old_indirection == 0:
+                snapshot_rid = self.table.alloc_tail_rid()
+                all_ones = (1 << num_cols) - 1
+                snapshot_record = [0, snapshot_rid, timestamp, all_ones] + list(base_row[4:])  # 原始 base 的用户列
+                self.table.write_record(is_tail=True, rid=snapshot_rid, columns=snapshot_record)
+                prev_rid = snapshot_rid
+
+            # Allocate tail RID（真正的“新版本”tail）
+            tail_rid = self.table.alloc_tail_rid()
+
+            # （二次修改）tail 的 indirection 永远指向上一条 tail（第一次为快照 tail）
+            tail_indirection = prev_rid
 
             # Build tail record
             tail_record = [tail_indirection, tail_rid, timestamp, schema_bits] + new_user_values
 
             # Write tail record
             self.table.write_record(is_tail=True, rid=tail_rid, columns=tail_record)
+
             # 你 Page.data 是 list[int]，不能用 struct 往里塞 bytes；要用覆盖写
             self.table.overwrite_value_at(base_locator, INDIRECTION_COLUMN, tail_rid)
             new_base_schema = base_row[SCHEMA_ENCODING_COLUMN] | schema_bits
             self.table.overwrite_value_at(base_locator, SCHEMA_ENCODING_COLUMN, new_base_schema)
 
-            # 三次修改 把 base 的用户列也覆盖成最新值，这样 select和sum不用每条记录再去读tail
+            # 【三次修改】把 base 的用户列覆盖成最新值，用来提速 select/sum。。。。。。。。（二次修改）旧版本靠“快照 tail”保留
             for i in range(num_cols):
                 self.table.overwrite_value_at(base_locator, 4 + i, new_user_values[i])
 
@@ -311,7 +323,7 @@ class Query:
 
             total = 0
             for rid in rids:
-                # （三次修改）既然 update 已经把 base 的用户列覆盖成最新，那 sum 直接用base，不再读 tail
+                # 【三次修改】update 已经把 base 的用户列覆盖成最新：sum 直接读 base 就行
                 locator = lookup(rid)
                 if locator is None:
                     continue
