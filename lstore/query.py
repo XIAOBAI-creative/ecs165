@@ -13,7 +13,7 @@ class Query:
     def __init__(self, table):
         self.table = table
         self._num_cols = table.num_columns
-        self._user_col_indices = list(range(4, 4 + table.num_columns))
+        # 五次修改：用 bitmask 表示“全列有效”，tail 存全量快照时直接用它
         self._all_ones = (1 << table.num_columns) - 1
 
 
@@ -81,7 +81,6 @@ class Query:
             if not rids:
                 return []
 
-            # 缓存常用的东西，少做属性查找
             lookup = self.table.lookup_locator
             storage = self.table._storage
             num_cols = self._num_cols
@@ -94,15 +93,26 @@ class Query:
                     continue
 
                 base_row = storage.read_record(locator)
-                user_columns = base_row[4:]
 
-                # Apply projection
+                # 五次修改：base 不再被 update 覆盖写用户列，所以这里要看 indirection
+                indirection = base_row[INDIRECTION_COLUMN]
+                if indirection != 0:
+                    tail_locator = lookup(indirection)
+                    if tail_locator is not None:
+                        row = storage.read_record(tail_locator)
+                    else:
+                        row = base_row
+                else:
+                    row = base_row
+
+                # Apply projection（避免 row[4:] 切片分配）
                 projected = [None] * num_cols
+                base_idx = 4
                 for i, keep in enumerate(projected_columns_index):
                     if keep:
-                        projected[i] = user_columns[i]
+                        projected[i] = row[base_idx + i]
 
-                primary_key = user_columns[key_col]
+                primary_key = row[base_idx + key_col]
                 results.append(Record(rid, primary_key, projected))
 
             return results
@@ -164,8 +174,11 @@ class Query:
         base_row = storage.read_record(locator)
         indirection = base_row[INDIRECTION_COLUMN]
 
+        # 没有 tail：只有 base
         if indirection == 0:
             return list(base_row[4:])
+
+        # 五次修改：tail 链结构：base.indirection -> 最新 tail，tail.indirection -> 上一条 tail（第一次为0）
         k = abs(relative_version)
         current_rid = indirection
         last_tail_row = None
@@ -183,10 +196,13 @@ class Query:
             current_rid = tail_row[INDIRECTION_COLUMN]
             k -= 1
 
-        # k 走过头：返回最老快照 tail
+        # 版本往回走过头：回到 base（因为 base 保存最老版本）
+        if k >= 0:
+            return list(base_row[4:])
+
+        # 理论上不会到这里，保底
         if last_tail_row is not None:
             return list(last_tail_row[4:])
-
         return list(base_row[4:])
 
 
@@ -206,42 +222,45 @@ class Query:
             if base_locator is None:
                 return False
 
+            lookup = self.table.lookup_locator
             storage = self.table._storage
             base_row = storage.read_record(base_locator)
             old_indirection = base_row[INDIRECTION_COLUMN]
 
             num_cols = self._num_cols
             timestamp = int(time())
-            current_values = base_row[4:]
 
-            schema_bits = 0
+            # 五次修改：取“当前最新行”作为快照源（第一次 update 用 base，否则用最新 tail）
+            if old_indirection == 0:
+                src_row = base_row
+            else:
+                tail_locator = lookup(old_indirection)
+                src_row = storage.read_record(tail_locator) if tail_locator is not None else base_row
+
+            # Build schema encoding and new values（new tail 存全量快照）
+            updated_bits = 0
             new_user_values = [0] * num_cols
+            base_idx = 4
             for i in range(num_cols):
                 v = columns[i]
                 if v is not None:
-                    schema_bits |= (1 << (num_cols - 1 - i))
+                    updated_bits |= (1 << (num_cols - 1 - i))
                     new_user_values[i] = v
                 else:
-                    new_user_values[i] = current_values[i]
+                    new_user_values[i] = src_row[base_idx + i]
 
-            prev_rid = old_indirection
-            if old_indirection == 0:
-                snapshot_rid = self.table.alloc_tail_rid()
-                snapshot_record = [0, snapshot_rid, timestamp, self._all_ones] + list(current_values)
-                self.table.write_record(is_tail=True, rid=snapshot_rid, columns=snapshot_record)
-                prev_rid = snapshot_rid
-
-            # 写新版本 tail（全列快照）
+            # 五次修改：只写 1 条 tail（全量快照），tail.indirection 指向上一条 tail（第一次就是 0）
             tail_rid = self.table.alloc_tail_rid()
-            tail_record = [prev_rid, tail_rid, timestamp, schema_bits] + new_user_values
+            tail_record = [old_indirection, tail_rid, timestamp, self._all_ones] + new_user_values
             self.table.write_record(is_tail=True, rid=tail_rid, columns=tail_record)
-            new_base_schema = base_row[SCHEMA_ENCODING_COLUMN] | schema_bits
+
+            # 五次修改：base 只覆盖写 2 个 int（indirection + schema），不再覆盖写用户列（update 速度会大幅下降开销）
+            new_base_schema = base_row[SCHEMA_ENCODING_COLUMN] | updated_bits
             self.table.overwrite_values_at(
                 base_locator,
                 [INDIRECTION_COLUMN, SCHEMA_ENCODING_COLUMN],
                 [tail_rid, new_base_schema]
             )
-            self.table.overwrite_values_at(base_locator, self._user_col_indices, new_user_values)
 
             return True
         except:
@@ -265,6 +284,7 @@ class Query:
             lookup = self.table.lookup_locator
             storage = self.table._storage
 
+            # 五次修改：sum 也要读“最新行”（base 或最新 tail），避免 row[4:] 切片
             total = 0
             col = 4 + aggregate_column_index
             for rid in rids:
@@ -272,7 +292,17 @@ class Query:
                 if locator is None:
                     continue
                 base_row = storage.read_record(locator)
-                total += base_row[col]
+                indirection = base_row[INDIRECTION_COLUMN]
+                if indirection != 0:
+                    tail_locator = lookup(indirection)
+                    if tail_locator is not None:
+                        row = storage.read_record(tail_locator)
+                    else:
+                        row = base_row
+                else:
+                    row = base_row
+
+                total += row[col]
 
             return total
         except:
