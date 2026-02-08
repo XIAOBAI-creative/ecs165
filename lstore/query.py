@@ -206,39 +206,30 @@ class Query:
             # No updates at all, return base
             return list(base_user_columns)  #(erxiciugai)这里再copy
 
-        # Collect all tail records in order (newest first)
-        tails = []
+        # 三次修改 update 里 new_user_values已经补全了 None，所以版本查询不需要 schema apply
+    #三次修改 直接从最新 tail 开始往后走 k 步，找到对应 tail，返回那条 tail 的 user columns
+        k = abs(relative_version)
         current_rid = indirection
-        while current_rid != 0 and current_rid >= 10_000_000:
+
+        while k > 0 and current_rid != 0 and current_rid >= 10_000_000:
             tail_locator = lookup(current_rid)
             if tail_locator is None:
+                current_rid = 0
                 break
             tail_row = storage.read_record(tail_locator)
-            tails.append(tail_row)
             current_rid = tail_row[INDIRECTION_COLUMN]
+            k -= 1
 
-        # relative_version: 0 = latest, -1 = one back, etc.
-        # We need to skip |relative_version| tails
-        skip = abs(relative_version)
-
-        if skip >= len(tails):
+        if current_rid == 0 or current_rid < 10_000_000:
             # Asking for version before any updates, return base
-            return list(base_user_columns)  # copy一次够了
+            return list(base_user_columns)
 
-        # Start from base and apply tails up to the desired version
-        user_columns = list(base_user_columns)  # 这里需要可写list，所以才copy
-        # Apply from oldest to (len - skip - 1)
-        tails_to_apply = tails[skip:][::-1]  # Reverse to apply oldest first
+        tail_locator = lookup(current_rid)
+        if tail_locator is None:
+            return list(base_user_columns)
 
-        for tail_row in tails_to_apply:
-            tail_schema = tail_row[SCHEMA_ENCODING_COLUMN]
-            tail_user_cols = tail_row[4:]
-            # (二次修改)局部变量num_cols，避免每次循环都self.table.num_columns，这些地方写的时候都下意识的避免重复，不然我改的时候太累了
-            for i in range(num_cols):
-                if (tail_schema >> (num_cols - 1 - i)) & 1:
-                    user_columns[i] = tail_user_cols[i]
-
-        return user_columns
+        tail_row = storage.read_record(tail_locator)
+        return list(tail_row[4:])
 
 
     """
@@ -293,6 +284,10 @@ class Query:
             new_base_schema = base_row[SCHEMA_ENCODING_COLUMN] | schema_bits
             self.table.overwrite_value_at(base_locator, SCHEMA_ENCODING_COLUMN, new_base_schema)
 
+            # 三次修改 把 base 的用户列也覆盖成最新值，这样 select和sum不用每条记录再去读tail
+            for i in range(num_cols):
+                self.table.overwrite_value_at(base_locator, 4 + i, new_user_values[i])
+
             return True
         except:
             return False
@@ -316,22 +311,12 @@ class Query:
 
             total = 0
             for rid in rids:
+                # （三次修改）既然 update 已经把 base 的用户列覆盖成最新，那 sum 直接用base，不再读 tail
                 locator = lookup(rid)
                 if locator is None:
                     continue
                 base_row = storage.read_record(locator)
-                indirection = base_row[INDIRECTION_COLUMN]
-                if indirection == 0:
-                    user_columns = base_row[4:]
-                else:
-                    tail_locator = lookup(indirection)
-                    if tail_locator is None:
-                        user_columns = base_row[4:]
-                    else:
-                        tail_row = storage.read_record(tail_locator)
-                        user_columns = tail_row[4:]
-
-                total += user_columns[aggregate_column_index]
+                total += base_row[4 + aggregate_column_index]
 
             return total
         except:
