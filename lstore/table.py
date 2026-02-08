@@ -39,32 +39,51 @@ class PageRange:
 
 # make a new page if the last one is full
     def _ensure_capacity_for_next_row(self):
-        for c in range(self.total_columns):
-            if not self.pages_by_col[c][-1].has_capacity():
+        """
+        不要每插一行就对每一列都检查一次 has_capacity()， 因为每一行都会对所有列都写一次，所以所有列的页增长是同步的
+        所以检查任意一列就行，比如第 0 列满了，那么所有列都会满，写的时候能不能稍微思考思考，这种地方就不要浪费我的时间去修正了
+        """
+        # 0 列最后一页
+        if not self.pages_by_col[0][-1].has_capacity():
+            for c in range(self.total_columns):
                 self.pages_by_col[c].append(Page())
 
     def append_row(self, values: List[int]) -> int:
+        """
+        追加total_columns个值，返回该行在本 PageRange的row_offset
+        """
         if len(values) != self.total_columns:
             raise ValueError("Row length does not match total_columns")
         self._ensure_capacity_for_next_row()
+        # 逐列写入最后一页
+        pages_by_col = self.pages_by_col  # 缓存一下能快点
         for c in range(self.total_columns):
-            self.pages_by_col[c][-1].write(values[c])
+            pages_by_col[c][-1].write(values[c])
         row_offset = self.num_rows
         self.num_rows += 1
         return row_offset
 
     def read_row(self, row_offset: int) -> List[int]:
+        """
+        读一行，返回 total_columns个值
+        """
         if row_offset < 0 or row_offset >= self.num_rows:
             raise IndexError("Row offset out of range for page range")
-        result = []
+        # 落在哪个 page以及页内 offset
         page_index = row_offset // Page.CAPACITY
         in_page_offset = row_offset % Page.CAPACITY
-        for c in range(self.total_columns):
-            page_list = self.pages_by_col[c]
+        pages_by_col = self.pages_by_col
+        total_cols = self.total_columns
+        # 预分配 list，这样append开销能少点
+        result = [0] * total_cols
+        for c in range(total_cols):
+            page_list = pages_by_col[c]
+            #保留一下保护吧
             if page_index >= len(page_list):
                 raise IndexError("Page index out of range in column")
-            result.append(page_list[page_index].read(in_page_offset))
+            result[c] = page_list[page_index].read(in_page_offset)
         return result
+
 
 
 #in-memory storage to satisfy base page ranges and tail page ranges
@@ -103,11 +122,19 @@ class Table:
         self.key = key
         self.num_columns = num_columns
         self.total_columns = 4 + num_columns
+        #RID -> RecordLocator
         self.page_directory: Dict[int, RecordLocator] = {}
+        #默认对 key列弄索引
         self.index = Index(self)
-        self.merge_threshold_pages = 50  # The threshold to trigger a merge
+        # 
+        +++++++++++++++++++++++
+        之前merge_threshold_pages同名方法会被这个 int 覆盖导致int不能被调用，以后千万别这么搞，不然milestone2肯定不过测试
+        +++++++++++++++++++
+        self.merge_threshold_pages = 50
+        #rid的分配，base 从小到大，tail用大数省的冲突
         self._next_base_rid = 1
         self._next_tail_rid = 10_000_000
+        # 存储
         self._storage = StorageEngine(self.total_columns)
 
     def __merge(self):
