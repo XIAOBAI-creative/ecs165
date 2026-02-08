@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(/usr/bin/python3:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(/opt/homebrew/bin/python3:*)"
+    ]
+  }
+}
