@@ -1,5 +1,7 @@
 """
-A data strucutre holding indices for various columns of a table. Key column should be indexd by default, other columns can be indexed through this object. Indices are usually B-Trees, but other data structures can be used as well.
+A data strucutre holding indices for various columns of a table.
+Key column should be indexed by default, other columns can be indexed through this object.
+Indices are usually B-Trees, but other data structures can be used as well.
 """
 
 from __future__ import annotations
@@ -7,34 +9,37 @@ from dataclasses import dataclass
 from bisect import bisect_left, bisect_right
 from typing import Any, List, Optional, Tuple
 
+
 @dataclass
 class Leaf:
     keys: List[int]
     # each key maps to a list of RIDs
-    vals: List[List[int]]          
+    vals: List[List[int]]
     next: Optional["Leaf"] = None
 
     @property
     def is_leaf(self) -> bool:
         return True
-    
+
+
 @dataclass
 class Internal:
     keys: List[int]
-    children: List[Any]            
-    # children are Internal or Leaf
+    children: List[Any]  # children are Internal or Leaf
 
     @property
     def is_leaf(self) -> bool:
         return False
 
+
 class BPlusTree:
     """
-    B+Tree supporting so far:
+    B+Tree supporting:
       - insert(key, rid)
       - find(key) -> list[rid]
       - range(begin, end) -> list[rid]
-    order = max number of keys in a node before split (so max children = order + 1)
+      - remove(key, rid) -> bool   (simplified delete, no rebalance)
+    order = max number of keys in a node before split (max children = order + 1)
     """
 
     def __init__(self, order: int = 32):
@@ -48,16 +53,15 @@ class BPlusTree:
         promoted_key = internal.keys[mid]
 
         left_keys = internal.keys[:mid]
-        right_keys = internal.keys[mid+1:]
-        left_children = internal.children[:mid+1]
-        right_children = internal.children[mid+1:]
+        right_keys = internal.keys[mid + 1 :]
+        left_children = internal.children[: mid + 1]
+        right_children = internal.children[mid + 1 :]
 
         new_internal = Internal(keys=right_keys, children=right_children)
         internal.keys = left_keys
         internal.children = left_children
 
         self._insert_in_parent(promoted_key, internal, new_internal, path)
-
 
     def _insert_in_parent(
         self,
@@ -66,20 +70,18 @@ class BPlusTree:
         right_child: Any,
         path: List[Tuple[Internal, int]],
     ) -> None:
-        # if splitting root
+        # splitting root
         if not path:
             self.root = Internal(keys=[key], children=[left_child, right_child])
             return
 
         parent, child_index = path.pop()  # where left_child was
-        # insert key into parent.keys at position child_index
         parent.keys.insert(child_index, key)
         parent.children.insert(child_index + 1, right_child)
 
         if len(parent.keys) > self.order:
             self._split_internal(parent, path)
 
-            
     def _split_leaf(self, leaf: Leaf, path: List[Tuple[Internal, int]]) -> None:
         mid = len(leaf.keys) // 2
         new_leaf = Leaf(keys=leaf.keys[mid:], vals=leaf.vals[mid:], next=leaf.next)
@@ -91,10 +93,7 @@ class BPlusTree:
         promoted_key = new_leaf.keys[0]
         self._insert_in_parent(promoted_key, leaf, new_leaf, path)
 
-
-
     def insert(self, key: int, rid: int) -> None:
-        # Path stack for split propagation
         path: List[Tuple[Internal, int]] = []
         node = self.root
 
@@ -108,16 +107,13 @@ class BPlusTree:
         leaf: Leaf = node
         i = bisect_left(leaf.keys, key)
         if i < len(leaf.keys) and leaf.keys[i] == key:
-            # duplicate key -> append rid
             leaf.vals[i].append(rid)
         else:
             leaf.keys.insert(i, key)
             leaf.vals.insert(i, [rid])
 
-        # split leaf if overflow
         if len(leaf.keys) > self.order:
             self._split_leaf(leaf, path)
-
 
     def _find_leaf(self, key: int) -> Leaf:
         node = self.root
@@ -134,64 +130,97 @@ class BPlusTree:
             return list(leaf.vals[i])
         return []
 
-
     def range(self, begin: int, end: int) -> List[int]:
         if begin > end:
             return []
         out: List[int] = []
         leaf = self._find_leaf(begin)
+
         while leaf is not None:
-            # start at first key >= begin
             i = bisect_left(leaf.keys, begin)
             while i < len(leaf.keys) and leaf.keys[i] <= end:
                 out.extend(leaf.vals[i])
                 i += 1
-            # If leaf has keys and the last key > end, we can stop early
             if leaf.keys and leaf.keys[-1] > end:
                 break
             leaf = leaf.next
         return out
 
-class Index:
+    def remove(self, key: int, rid: int) -> bool:
+        """
+        Simplified delete:
+          - remove rid under key
+          - if rid-list becomes empty, remove key entry
+        No rebalancing/merge (good enough for M1).
+        """
+        leaf = self._find_leaf(key)
+        i = bisect_left(leaf.keys, key)
+        if i >= len(leaf.keys) or leaf.keys[i] != key:
+            return False
 
+        rids = leaf.vals[i]
+        try:
+            rids.remove(rid)
+        except ValueError:
+            return False
+
+        if len(rids) == 0:
+            leaf.keys.pop(i)
+            leaf.vals.pop(i)
+
+        return True
+
+
+class Index:
     def __init__(self, table):
-        # One index for each table. All our empty initially.
+        # One index object per table. All indices empty initially.
         self.table = table
-        self.indices = [None] *  table.num_columns
+        self.indices = [None] * table.num_columns
 
         # key column indexed by default
         self.create_index(table.key)
 
-    """
-    # returns the location of all records with the given value on column "column"
-    """
-
+    # returns the location (RIDs) of all records with the given value on column "column"
     def locate(self, column, value):
         tree = self.indices[column]
         if tree is None:
             return []
         return tree.find(int(value))
 
-    """
     # Returns the RIDs of all records with values in column "column" between "begin" and "end"
-    """
-
     def locate_range(self, begin, end, column):
         tree = self.indices[column]
         if tree is None:
             return []
         return tree.range(int(begin), int(end))
 
-    """
     # optional: Create index on specific column
-    """
-
     def create_index(self, column_number):
         if self.indices[column_number] is None:
-            self.indices[column_number] = BPlusTree( )
-    """
-    # optional: Drop index of specific column
-    """
+            self.indices[column_number] = BPlusTree()
 
+    # optional: Drop index of specific column
     def drop_index(self, column_number):
         self.indices[column_number] = None
+
+    # -----------------------------
+    # Wrappers expected by Query
+    # -----------------------------
+    def insert_entry(self, column: int, value: int, rid: int) -> None:
+        """
+        Insert mapping (value -> rid) for a given column.
+        Many Query implementations call this.
+        """
+        if self.indices[column] is None:
+            self.create_index(column)
+        self.indices[column].insert(int(value), int(rid))
+
+    def delete_entry(self, column: int, value: int, rid: int) -> None:
+        """
+        Delete mapping (value -> rid) for a given column.
+        Best-effort for M1 (no rebalance).
+        """
+        tree = self.indices[column]
+        if tree is None:
+            return
+        tree.remove(int(value), int(rid))
