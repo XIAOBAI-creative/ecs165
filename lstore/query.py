@@ -76,16 +76,16 @@ class Query:
         indirection = base_row[INDIRECTION_COLUMN]
 
         if indirection == 0:
-            # No updates, return base values
-            return list(base_row[4:])
+            # 别list复制了，直接切片返回，这样少一次构建Python list
+            return base_row[4:]
 
         # Get the latest tail record - it contains all current values
         tail_locator = self.table.lookup_locator(indirection)
         if tail_locator is None:
-            return list(base_row[4:])
+            return base_row[4:]
 
         tail_row = self.table._storage.read_record(tail_locator)
-        return list(tail_row[4:])
+        return tail_row[4:]
 
 
     """
@@ -103,21 +103,37 @@ class Query:
             if not rids:
                 return []
 
+            # （二次修改）缓存常用的东西，少做属性查找
+            lookup = self.table.lookup_locator
+            storage = self.table._storage
+            num_cols = self.table.num_columns
+            key_col = self.table.key
+
             results = []
             for rid in rids:
-                user_columns = self._get_latest_values(rid)
-                if user_columns is None:
+                # （二次修改）把 _get_latest_values 展开到这里，这样少一次函数调用就少一次 list 构造
+                locator = lookup(rid)
+                if locator is None:
                     continue
+                base_row = storage.read_record(locator)
+                indirection = base_row[INDIRECTION_COLUMN]
+                if indirection == 0:
+                    user_columns = base_row[4:]
+                else:
+                    tail_locator = lookup(indirection)
+                    if tail_locator is None:
+                        user_columns = base_row[4:]
+                    else:
+                        tail_row = storage.read_record(tail_locator)
+                        user_columns = tail_row[4:]
 
                 # Apply projection
-                projected = []
+                # （二次修改）不append 循环，直接一次性分配 list再按位往里填
+                projected = [None] * num_cols
                 for i, keep in enumerate(projected_columns_index):
                     if keep:
-                        projected.append(user_columns[i])
-                    else:
-                        projected.append(None)
-
-                primary_key = user_columns[self.table.key]
+                        projected[i] = user_columns[i]
+                primary_key = user_columns[key_col]
                 record = Record(rid, primary_key, projected)
                 results.append(record)
 
@@ -143,6 +159,10 @@ class Query:
             if not rids:
                 return []
 
+            # 还是少属性查找
+            num_cols = self.table.num_columns
+            key_col = self.table.key
+
             results = []
             for rid in rids:
                 user_columns = self._get_version_values(rid, relative_version)
@@ -150,14 +170,13 @@ class Query:
                     continue
 
                 # Apply projection
-                projected = []
+                #还是一次性分配list再按位填
+                projected = [None] * num_cols
                 for i, keep in enumerate(projected_columns_index):
                     if keep:
-                        projected.append(user_columns[i])
-                    else:
-                        projected.append(None)
+                        projected[i] = user_columns[i]
 
-                primary_key = user_columns[self.table.key]
+                primary_key = user_columns[key_col]
                 record = Record(rid, primary_key, projected)
                 results.append(record)
 
@@ -171,26 +190,30 @@ class Query:
         Helper: get values at a specific version.
         relative_version = 0 means latest, -1 means one version back, etc.
         """
-        locator = self.table.lookup_locator(base_rid)
+        #以后再有类似的东西都换成我这样的，属性查找太慢了
+        lookup = self.table.lookup_locator
+        storage = self.table._storage
+        num_cols = self.table.num_columns
+
+        locator = lookup(base_rid)
         if locator is None:
             return None
 
-        base_row = self.table._storage.read_record(locator)
-        base_user_columns = list(base_row[4:])
+        base_row = storage.read_record(locator)
+        base_user_columns = base_row[4:]   #（二次修改）别 list复制，后面需要copy的时候再copy
         indirection = base_row[INDIRECTION_COLUMN]
-
         if indirection == 0:
             # No updates at all, return base
-            return base_user_columns
+            return list(base_user_columns)  #(erxiciugai)这里再copy
 
         # Collect all tail records in order (newest first)
         tails = []
         current_rid = indirection
         while current_rid != 0 and current_rid >= 10_000_000:
-            tail_locator = self.table.lookup_locator(current_rid)
+            tail_locator = lookup(current_rid)
             if tail_locator is None:
                 break
-            tail_row = self.table._storage.read_record(tail_locator)
+            tail_row = storage.read_record(tail_locator)
             tails.append(tail_row)
             current_rid = tail_row[INDIRECTION_COLUMN]
 
@@ -200,18 +223,19 @@ class Query:
 
         if skip >= len(tails):
             # Asking for version before any updates, return base
-            return base_user_columns
+            return list(base_user_columns)  # copy一次够了
 
         # Start from base and apply tails up to the desired version
-        user_columns = list(base_user_columns)
+        user_columns = list(base_user_columns)  # 这里需要可写list，所以才copy
         # Apply from oldest to (len - skip - 1)
         tails_to_apply = tails[skip:][::-1]  # Reverse to apply oldest first
 
         for tail_row in tails_to_apply:
             tail_schema = tail_row[SCHEMA_ENCODING_COLUMN]
             tail_user_cols = tail_row[4:]
-            for i in range(self.table.num_columns):
-                if (tail_schema >> (self.table.num_columns - 1 - i)) & 1:
+            # (二次修改)局部变量num_cols，避免每次循环都self.table.num_columns，这些地方写的时候都下意识的避免重复，不然我改的时候太累了
+            for i in range(num_cols):
+                if (tail_schema >> (num_cols - 1 - i)) & 1:
                     user_columns[i] = tail_user_cols[i]
 
         return user_columns
@@ -243,9 +267,11 @@ class Query:
             # Build schema encoding and new values
             schema_bits = 0
             new_user_values = []
-            for i in range(self.table.num_columns):
+            #缓存 num_cols，少属性查找
+            num_cols = self.table.num_columns
+            for i in range(num_cols):
                 if columns[i] is not None:
-                    schema_bits |= (1 << (self.table.num_columns - 1 - i))
+                    schema_bits |= (1 << (num_cols - 1 - i))
                     new_user_values.append(columns[i])
                 else:
                     new_user_values.append(current_values[i])
@@ -262,12 +288,8 @@ class Query:
 
             # Write tail record
             self.table.write_record(is_tail=True, rid=tail_rid, columns=tail_record)
-
-            # 【修改】Update base record's indirection to point to new tail
             # 你 Page.data 是 list[int]，不能用 struct 往里塞 bytes；要用覆盖写
             self.table.overwrite_value_at(base_locator, INDIRECTION_COLUMN, tail_rid)
-
-            # 【修改】base 的 schema encoding 要记录哪些列被更新过（OR 进去）
             new_base_schema = base_row[SCHEMA_ENCODING_COLUMN] | schema_bits
             self.table.overwrite_value_at(base_locator, SCHEMA_ENCODING_COLUMN, new_base_schema)
 
@@ -284,17 +306,32 @@ class Query:
     # Returns the summation of the given range upon success
     # Returns False if no record exists in the given range
     """
-    def sum(self, start_range: int, end_range: int, aggregate_column_index: int):
+    def sum(self, start_range: int, end_range: int, aggregate_column_index: int):#（二次修改）同select一样，别属性查找然后少repeat不必要的东西
         try:
             rids = self.table.index.locate_range(start_range, end_range, self.table.key)
             if not rids:
                 return False
+            lookup = self.table.lookup_locator
+            storage = self.table._storage
 
             total = 0
             for rid in rids:
-                user_columns = self._get_latest_values(rid)
-                if user_columns is not None:
-                    total += user_columns[aggregate_column_index]
+                locator = lookup(rid)
+                if locator is None:
+                    continue
+                base_row = storage.read_record(locator)
+                indirection = base_row[INDIRECTION_COLUMN]
+                if indirection == 0:
+                    user_columns = base_row[4:]
+                else:
+                    tail_locator = lookup(indirection)
+                    if tail_locator is None:
+                        user_columns = base_row[4:]
+                    else:
+                        tail_row = storage.read_record(tail_locator)
+                        user_columns = tail_row[4:]
+
+                total += user_columns[aggregate_column_index]
 
             return total
         except:
