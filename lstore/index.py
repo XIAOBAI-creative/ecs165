@@ -5,222 +5,70 @@ Indices are usually B-Trees, but other data structures can be used as well.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+
 from bisect import bisect_left, bisect_right
-from typing import Any, List, Optional, Tuple
-
-
-@dataclass
-class Leaf:
-    keys: List[int]
-    # each key maps to a list of RIDs
-    vals: List[List[int]]
-    next: Optional["Leaf"] = None
-
-    @property
-    def is_leaf(self) -> bool:
-        return True
-
-
-@dataclass
-class Internal:
-    keys: List[int]
-    children: List[Any]  # children are Internal or Leaf
-
-    @property
-    def is_leaf(self) -> bool:
-        return False
-
-
-class BPlusTree:
-    """
-    B+Tree supporting:
-      - insert(key, rid)
-      - find(key) -> list[rid]
-      - range(begin, end) -> list[rid]
-      - remove(key, rid) -> bool   (simplified delete, no rebalance)
-    order = max number of keys in a node before split (max children = order + 1)
-    """
-
-    def __init__(self, order: int = 32):
-        if order < 3:
-            raise ValueError("order must be >= 3")
-        self.order = order
-        self.root: Any = Leaf(keys=[], vals=[], next=None)
-
-    def _split_internal(self, internal: Internal, path: List[Tuple[Internal, int]]) -> None:
-        mid = len(internal.keys) // 2
-        promoted_key = internal.keys[mid]
-
-        left_keys = internal.keys[:mid]
-        right_keys = internal.keys[mid + 1 :]
-        left_children = internal.children[: mid + 1]
-        right_children = internal.children[mid + 1 :]
-
-        new_internal = Internal(keys=right_keys, children=right_children)
-        internal.keys = left_keys
-        internal.children = left_children
-
-        self._insert_in_parent(promoted_key, internal, new_internal, path)
-
-    def _insert_in_parent(
-        self,
-        key: int,
-        left_child: Any,
-        right_child: Any,
-        path: List[Tuple[Internal, int]],
-    ) -> None:
-        # splitting root
-        if not path:
-            self.root = Internal(keys=[key], children=[left_child, right_child])
-            return
-
-        parent, child_index = path.pop()  # where left_child was
-        parent.keys.insert(child_index, key)
-        parent.children.insert(child_index + 1, right_child)
-
-        if len(parent.keys) > self.order:
-            self._split_internal(parent, path)
-
-    def _split_leaf(self, leaf: Leaf, path: List[Tuple[Internal, int]]) -> None:
-        mid = len(leaf.keys) // 2
-        new_leaf = Leaf(keys=leaf.keys[mid:], vals=leaf.vals[mid:], next=leaf.next)
-        leaf.keys = leaf.keys[:mid]
-        leaf.vals = leaf.vals[:mid]
-        leaf.next = new_leaf
-
-        # promote the first key of new leaf
-        promoted_key = new_leaf.keys[0]
-        self._insert_in_parent(promoted_key, leaf, new_leaf, path)
-
-    def insert(self, key: int, rid: int) -> None:
-        path: List[Tuple[Internal, int]] = []
-        node = self.root
-
-        # descend to leaf
-        while not node.is_leaf:
-            internal: Internal = node
-            idx = bisect_right(internal.keys, key)
-            path.append((internal, idx))
-            node = internal.children[idx]
-
-        leaf: Leaf = node
-        i = bisect_left(leaf.keys, key)
-        if i < len(leaf.keys) and leaf.keys[i] == key:
-            leaf.vals[i].append(rid)
-        else:
-            leaf.keys.insert(i, key)
-            leaf.vals.insert(i, [rid])
-
-        if len(leaf.keys) > self.order:
-            self._split_leaf(leaf, path)
-
-    def _find_leaf(self, key: int) -> Leaf:
-        node = self.root
-        while not node.is_leaf:
-            internal: Internal = node
-            idx = bisect_right(internal.keys, key)
-            node = internal.children[idx]
-        return node
-
-    def find(self, key: int) -> List[int]:
-        leaf = self._find_leaf(key)
-        i = bisect_left(leaf.keys, key)
-        if i < len(leaf.keys) and leaf.keys[i] == key:
-            return list(leaf.vals[i])
-        return []
-
-    def range(self, begin: int, end: int) -> List[int]:
-        if begin > end:
-            return []
-        out: List[int] = []
-        leaf = self._find_leaf(begin)
-
-        while leaf is not None:
-            i = bisect_left(leaf.keys, begin)
-            while i < len(leaf.keys) and leaf.keys[i] <= end:
-                out.extend(leaf.vals[i])
-                i += 1
-            if leaf.keys and leaf.keys[-1] > end:
-                break
-            leaf = leaf.next
-        return out
-
-    def remove(self, key: int, rid: int) -> bool:
-        """
-        Simplified delete:
-          - remove rid under key
-          - if rid-list becomes empty, remove key entry
-        No rebalancing/merge (good enough for M1).
-        """
-        leaf = self._find_leaf(key)
-        i = bisect_left(leaf.keys, key)
-        if i >= len(leaf.keys) or leaf.keys[i] != key:
-            return False
-
-        rids = leaf.vals[i]
-        try:
-            rids.remove(rid)
-        except ValueError:
-            return False
-
-        if len(rids) == 0:
-            leaf.keys.pop(i)
-            leaf.vals.pop(i)
-
-        return True
+from typing import List
 
 
 class Index:
     def __init__(self, table):
-        # One index object per table. All indices empty initially.
         self.table = table
+        # 注：M1中我们只支持单列索引
+        # 因此这里的indices列表长度为table.num_columns
+        # 但实际上只有一个元素会被使用
+        # （即：索引只会建立在主键列上）
         self.indices = [None] * table.num_columns
 
-        # key column indexed by default
-        self.create_index(table.key)
-
-    # returns the location (RIDs) of all records with the given value on column "column"
-    def locate(self, column, value):
-        tree = self.indices[column]
-        if tree is None:
+    # 通过column和value定位记录，使用dict快速定位单个主键列的记录
+    def locate(self, column: int, value: int) -> List[int]:
+        if int(column) != self.table.key:
             return []
-        return tree.find(int(value))
+        # key2rid是一种使用hash表实现的索引结构，
+        # 能够在O(1)内根据主键值找到对应的记录ID（RID）
+        rid = self.table.key2rid.get(int(value))
+        return [] if rid is None else [rid]
 
-    # Returns the RIDs of all records with values in column "column" between "begin" and "end"
-    def locate_range(self, begin, end, column):
-        tree = self.indices[column]
-        if tree is None:
+    # key2rid的hash方式不适用于范围查询，
+    # 因此我们需要通过sorted_keys来获取范围内的记录ID
+    def locate_range(self, begin: int, end: int, column: int) -> List[int]:
+        if int(column) != self.table.key:
             return []
-        return tree.range(int(begin), int(end))
+        if begin > end:
+            return []
 
-    # optional: Create index on specific column
-    def create_index(self, column_number):
-        if self.indices[column_number] is None:
-            self.indices[column_number] = BPlusTree()
+        keys = self.table.sorted_keys
+        # 二分法的方式找begin和end更快速
+        lo = bisect_left(keys, int(begin))
+        hi = bisect_right(keys, int(end))
+        rids = self.table.sorted_rids
+        return [rids[i] for i in range(lo, hi)]
 
-    # optional: Drop index of specific column
-    def drop_index(self, column_number):
-        self.indices[column_number] = None
+    # optional: Create index on specific column (no-op for M1)
+    def create_index(self, column_number: int):
+        return
+
+    # optional: Drop index of specific column (no-op for M1)
+    def drop_index(self, column_number: int):
+        return
 
     # -----------------------------
     # Wrappers expected by Query
     # -----------------------------
-    def insert_entry(self, column: int, value: int, rid: int) -> None:
-        """
-        Insert mapping (value -> rid) for a given column.
-        Many Query implementations call this.
-        """
-        if self.indices[column] is None:
-            self.create_index(column)
-        self.indices[column].insert(int(value), int(rid))
 
-    def delete_entry(self, column: int, value: int, rid: int) -> None:
-        """
-        Delete mapping (value -> rid) for a given column.
-        Best-effort for M1 (no rebalance).
-        """
-        tree = self.indices[column]
-        if tree is None:
+    # 将列的某个值（key）映射到它对应的数据记录位置（RID）
+    def insert_entry(self, column: int, value: int, rid: int) -> None:
+        if int(column) != self.table.key:
             return
-        tree.remove(int(value), int(rid))
+        key = int(value)
+        rid = int(rid)
+        self.table.key2rid[key] = rid
+        self.table.register_key(key, rid)
+
+
+    # 将列的某个值（key）取消映射到对应的数据记录（RID）
+    def delete_entry(self, column: int, value: int, rid: int) -> None:
+        if int(column) != self.table.key:
+            return
+        key = int(value)
+        self.table.key2rid.pop(key, None)
+        self.table.unregister_key(key)
