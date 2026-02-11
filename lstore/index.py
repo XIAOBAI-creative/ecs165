@@ -31,12 +31,6 @@ class Index:
     # key2rid的hash方式不适用于范围查询，
     # 因此我们需要通过sorted_keys来获取范围内的记录ID
     def locate_range(self, begin: int, end: int, column: int) -> List[int]:
-      """  if int(column) != self.table.key:
-            return []
-        if begin > end:
-            return []
-            每次不要搞这种东西，你放上来没有用
-"""
         keys = self.table.sorted_keys
         # 二分法的方式找begin和end更快速
         lo = bisect_left(keys, int(begin))
