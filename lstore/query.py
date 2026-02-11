@@ -1,13 +1,8 @@
 
 from __future__ import annotations
-
 from bisect import bisect_left, bisect_right
-
 from typing import List, Optional
-
 from lstore.table import Record, Table
-
-
 class Query:
     """Query interface for Milestone 1 (all-in optimized).
 
@@ -17,15 +12,15 @@ class Query:
       - sum uses per-column Fenwick tree over key-order
     """
 
-    def __init__(self, table: Table):
+    def __init__(self, table: Table):#当前table
         self.table = table
         self._num_cols = table.num_columns
-        self._key_col = table.key
+        self._key_col = table.key #主键
 
     def delete(self, primary_key: int):
         try:
             k = int(primary_key)
-            rid = self.table.key2rid.get(k)
+            rid = self.table.key2rid.get(k)#主键找rid
             if rid is None:
                 return False
 
@@ -40,7 +35,7 @@ class Query:
             return False
 
     def insert(self, *columns):
-        try:
+        try:#匹配列数
             if len(columns) != self._num_cols:
                 return False
             rid = self.table.alloc_base_rid()
@@ -151,11 +146,9 @@ class Query:
                 return []
     def sum_version(self, start_range: int, end_range: int, aggregate_column_index: int, relative_version: int) -> int:
             """Aggregate (sum) over a key range at a specific relative version.
-
-            Tester semantics (m1_tester_new.py):
-              - version 0  : latest (current) version
-              - version -1 : previous (1 step back); clamp to oldest if missing
-              - version -2 : 2 steps back; clamp to oldest if missing
+              0：latest (current) version
+             -1：previous (1 step back); clamp to oldest if missing
+             -2:2 steps back; clamp to oldest if missing
             """
             try:
                 start_k = int(start_range)
@@ -167,7 +160,7 @@ class Query:
 
                 # Fast path: latest version uses BIT to be O(log n)
                 if rv == 0:
-                    return int(self.table.sum_range(start_k, end_k, c))
+                    return int(self.table.sum_range(start_k, end_k, c))#newest
 
                 keys = self.table.sorted_keys
                 rids = self.table.sorted_rids
