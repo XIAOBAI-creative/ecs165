@@ -1,15 +1,6 @@
-"""
-A data strucutre holding indices for various columns of a table.
-Key column should be indexed by default, other columns can be indexed through this object.
-Indices are usually B-Trees, but other data structures can be used as well.
-"""
-
 from __future__ import annotations
-
 from bisect import bisect_left, bisect_right
 from typing import List
-
-
 class Index:
     def __init__(self, table):
         self.table = table
