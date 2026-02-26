@@ -1,0 +1,95 @@
+from lstore.db import Database
+from lstore.query import Query
+
+from random import choice, randint, sample, seed
+
+db = Database()
+db.open('./ECS165')
+# Create a table  with 5 columns
+#   Student Id and 4 grades
+#   The first argument is name of the table
+#   The second argument is the number of columns
+#   The third argument is determining the which columns will be primay key
+#       Here the first column would be student id and primary key
+grades_table = db.create_table('Grades', 5, 0)
+
+# create a query class for the grades table
+query = Query(grades_table)
+
+# dictionary for records to test the database: test directory
+records = {}
+
+number_of_records = 1000
+number_of_aggregates = 100
+number_of_updates = 1
+
+seed(3562901)
+
+counter2 = 0
+for i in range(0, number_of_records):
+    key = 92106429 + i
+    records[key] = [key, randint(0, 20), randint(0, 20), randint(0, 20), randint(0, 20)]
+    if query.insert(*records[key]):
+        counter2 += 1
+keys = sorted(list(records.keys()))
+print("Insert finished")
+print(counter2, "records inserted")
+
+# Check inserted records using select query
+for key in keys:
+    record = query.select(key, 0, [1, 1, 1, 1, 1])[0]
+    error = False
+    for i, column in enumerate(record.columns):
+        if column != records[key][i]:
+            error = True
+    if error:
+        print('select error on', key, ':', record, ', correct:', records[key])
+    else:
+        pass
+        # print('select on', key, ':', record)
+print("Select finished")
+
+counter2 = 0
+# x update on every column
+for _ in range(number_of_updates):
+    counter = 0
+    for key in keys:
+        updated_columns = [None, None, None, None, None]
+        # copy record to check
+        original = records[key].copy()
+        for i in range(2, grades_table.num_columns):
+            # updated value
+            value = randint(0, 20)
+            updated_columns[i] = value
+            # update our test directory
+            records[key][i] = value
+        query.update(key, *updated_columns)
+        record = query.select(key, 0, [1, 1, 1, 1, 1])[0]
+        error = False
+        for j, column in enumerate(record.columns):
+            if column != records[key][j]:
+                error = True
+        if error:
+            counter2 += 1
+            print('update error on', original, 'and', updated_columns, ':', record, ', correct:', records[key])
+        else:
+            pass
+            # print('update on', original, 'and', updated_columns, ':', record)
+        counter += 1
+print("Update finished")
+
+counter3 = 0
+for i in range(0, number_of_aggregates):
+    r = sorted(sample(range(0, len(keys)), 2))
+    column_sum = sum(map(lambda key: records[key][0], keys[r[0]: r[1] + 1]))
+    result = query.sum(keys[r[0]], keys[r[1]], 0)
+    if column_sum != result:
+        counter3 += 1
+        print('sum error on [', keys[r[0]], ',', keys[r[1]], ']: ', result, ', correct: ', column_sum)
+    else:
+        pass
+        # print('sum on [', keys[r[0]], ',', keys[r[1]], ']: ', column_sum)
+print("Aggregate finished")
+print(counter2, "failed updates")
+print(counter3, "failed sums")
+db.close()
