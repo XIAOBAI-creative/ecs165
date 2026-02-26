@@ -5,15 +5,6 @@ from array import array
 
 
 class Page:
-    """
-    Disk format: EXACTLY 4096 bytes.
-
-    Layout (512 x uint64 slots):
-      slot[0] = num_records (uint64)
-      slot[1..] = data values (uint64), padded with 0
-
-    So effective data capacity = 511 values per page.
-    """
 
     PAGE_SIZE = 4096
     INT_SIZE = 8  # 64-bit
