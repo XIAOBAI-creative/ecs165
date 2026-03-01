@@ -365,6 +365,7 @@ class Transaction:
                         real_rid = self.table.key2rid.get(pk)
                         if real_rid is not None:
                             undo.base_rid = int(real_rid)
+                            self.lm.acquire_X(self.txn_id, int(real_rid)) #修复：锁真实 base_rid，避免并发 update/delete
                     except Exception:
                         pass
 
