@@ -104,38 +104,28 @@ class LockManager:
             raise LockConflict()
 
     def release_all(self, txn_id: int) -> None:
-       #  释放某个事务持有的全部锁。必须2PL只在 commit/abort 调用
+        """
+        释放某个事务持有的全部锁， 2PL只在commit/abort 调用
+        修复：事务可能对同一 rid 重复 acquire，会导致 s_count/x_count > 1，但 txn_resources 只是 set，release_all 只遍历一次，会只减 1，造成锁残留，strict 2PL 下 release_all 应该清空该 txn 在该 rid 上的所有持有，而不是计数-1
+        """
         with self._mu:
             resources = self._txn_resources.pop(txn_id, set())
             for rid in list(resources):
                 st = self._locks.get(rid)
                 if st is None:
                     continue
-                # 释放X（如果自己是 x_owner）
+                # 1，清掉该 txn 的 X，不管重入次数
                 if st.x_owner == txn_id:
-                    cnt = st.x_count.get(txn_id, 0)
-                    if cnt <= 1:
-                        st.x_count.pop(txn_id, None)
-                        st.x_owner = None
-                        # 如果没有共享锁持有者，则完全解锁；否则退回到 S
-                        if not st.s_owners:
-                            st.mode = "UNLOCKED"
-                        else:
-                            st.mode = "S"
-                    else:
-                        st.x_count[txn_id] = cnt - 1
-
-                # 释放 S（如果在 s_owners 里）
-                if txn_id in st.s_owners:
-                    cnt = st.s_count.get(txn_id, 0)
-                    if cnt <= 1:
-                        st.s_count.pop(txn_id, None)
-                        st.s_owners.discard(txn_id)
-                        if st.mode == "S" and not st.s_owners and st.x_owner is None:
-                            st.mode = "UNLOCKED"
-                    else:
-                        st.s_count[txn_id] = cnt - 1
-
-                # 完全空闲就从表里删除，减小locktable
+                    st.x_owner = None
+                st.x_count.pop(txn_id, None)
+                # 2， 清掉该 txn 的 S，不管重入
+                st.s_owners.discard(txn_id)
+                st.s_count.pop(txn_id, None)
+                # 3，重新算mode
+                if st.x_owner is None:
+                    st.mode = "S" if st.s_owners else "UNLOCKED"
+                else:
+                    st.mode = "X"
+                # 4，完全空闲则从表里删除
                 if st.mode == "UNLOCKED" and not st.s_owners and st.x_owner is None:
                     self._locks.pop(rid, None)
