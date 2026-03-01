@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List, Optional
 from lstore.table import Record, Table
+from lstore.lock_manager import LockConflict  # NEW: 处理 no-wait 冲突
 
 
 class Query:
@@ -82,7 +83,7 @@ class Query:
     # -------------------------
     # SELECT (latest)
     # -------------------------
-    def select(self, key: int, column: int, query_columns: List[int]) -> List[Record]:
+    def select(self, key: int, column: int, query_columns: List[int], txn=None) -> List[Record]:
         # IMPORTANT: do NOT force-apply merges on read path
         try:
             search_col = int(column)
@@ -96,6 +97,15 @@ class Query:
                 base_rid = int(base_rid)
                 if self.table.is_deleted_rid(base_rid):
                     return []
+
+                # NEW: 读之前拿 S 锁（no-wait），拿不到直接失败（让 Transaction abort）
+                if txn is not None:
+                    try:
+                        lm = getattr(txn, "lm", None)
+                        if lm is not None:
+                            lm.acquire_S(getattr(txn, "txn_id", -1), int(base_rid))
+                    except LockConflict:
+                        return False
 
                 latest = self.table.read_latest_user_columns(base_rid)
 
@@ -116,6 +126,16 @@ class Query:
                 for rid in self.table.all_base_rids():
                     if self.table.is_deleted_rid(rid):
                         continue
+
+                    # NEW: 扫描时“边扫边拿 S 锁”（no-wait）
+                    if txn is not None:
+                        try:
+                            lm = getattr(txn, "lm", None)
+                            if lm is not None:
+                                lm.acquire_S(getattr(txn, "txn_id", -1), int(rid))
+                        except LockConflict:
+                            return False
+
                     v = self.table.read_latest_user_value(rid, search_col)
                     if int(v) == search_val:
                         rids.append(int(rid))
@@ -124,6 +144,16 @@ class Query:
             for rid in rids:
                 if self.table.is_deleted_rid(rid):
                     continue
+
+                # NEW: 真正读 latest 之前再拿一次 S 锁（重复 acquire 可重入/幂等）
+                if txn is not None:
+                    try:
+                        lm = getattr(txn, "lm", None)
+                        if lm is not None:
+                            lm.acquire_S(getattr(txn, "txn_id", -1), int(rid))
+                    except LockConflict:
+                        return False
+
                 latest = self.table.read_latest_user_columns(int(rid))
 
                 projected: List[Optional[int]] = [None] * self._num_cols
@@ -177,7 +207,7 @@ class Query:
     # -------------------------
     # SUM (latest)
     # -------------------------
-    def sum(self, start_range: int, end_range: int, aggregate_column_index: int):
+    def sum(self, start_range: int, end_range: int, aggregate_column_index: int, txn=None):
         try:
             start_k = int(start_range)
             end_k = int(end_range)
@@ -188,7 +218,13 @@ class Query:
             record_found = False
             total = 0
             for i in range(start_k, end_k + 1):
-                record = self.select(i, self._key_col, [1] * self._num_cols)
+                # NEW: 把 txn 传下去，让 select 在读路径拿 S 锁
+                record = self.select(i, self._key_col, [1] * self._num_cols, txn=txn)
+
+                # NEW: no-wait 读锁冲突时 select 会返回 False，这里直接返回 False 让 Transaction abort
+                if record is False:
+                    return False
+
                 if not record:
                     continue
                 record_found = True
