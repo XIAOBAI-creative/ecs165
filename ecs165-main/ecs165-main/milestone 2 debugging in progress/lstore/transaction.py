@@ -135,16 +135,17 @@ class Transaction:
 
         if name == "insert":
             # 预测下一条 base rid（用于 abort 时删索引/删 key2rid）
+            # 注意：多线程下 predicted rid 不可靠，所以这里只先占位，真正 base_rid 在 insert 成功后从 key2rid 里拿
             if len(args) <= self.table.key:
                 return None
             pk = int(args[self.table.key])
-            predicted_rid = int(getattr(self.table, "_next_base_rid", 0))
+            predicted_rid = int(getattr(self.table, "_next_base_rid", 0))  # 仍保留，作为占位
             # 保存整行（用于 abort 时回滚索引）
             row = [int(x) for x in args]
             indexed = [(c, int(row[c])) for c in range(self.table.num_columns) if self.table.index.is_indexed(c)]
             return UndoEntry(
                 typ="INSERT",
-                base_rid=predicted_rid,
+                base_rid=predicted_rid,   # 先占位；insert 成功后会被 run() 改成真实 base_rid
                 payload={"pk": pk, "indexed": indexed},
             )
 
@@ -345,12 +346,27 @@ class Transaction:
                     undo = self._capture_before_write(op, args)
 
                 # 4.执行操作
-                result = op(*args)
+                # 只对 select/sum 传 txn（避免 insert/update/delete/increment 因为不支持关键字参数而 TypeError）
+                op_name = getattr(op, "__name__", "")
+                if op_name in ("select", "sum"):
+                    result = op(*args, txn=self)
+                else:
+                    result = op(*args)
 
                 # select 返回 list 也算成功,只有 False 才算失败
                 ok = (result is not False)
                 if not ok:
                     return self.abort()
+
+                # insert 成功后：把 undo 里的 base_rid 改成真实 base_rid（必须从 key2rid 拿）
+                if undo is not None and undo.typ == "INSERT":
+                    try:
+                        pk = int(undo.payload["pk"])
+                        real_rid = self.table.key2rid.get(pk)
+                        if real_rid is not None:
+                            undo.base_rid = int(real_rid)
+                    except Exception:
+                        pass
 
                 # 5.写后补 undo
                 if undo is not None:
