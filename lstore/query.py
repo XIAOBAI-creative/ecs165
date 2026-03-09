@@ -69,20 +69,26 @@ class Query:
         try:
             if len(columns) != self._num_cols:
                 return False
-
+    
             # NULLs not allowed on insert
             if any(v is None for v in columns):
                 return False
-
+    
             row = [int(x) for x in columns]
+    
+            pk = int(row[self._key_col])
+            existing = self.table.key2rid.get(pk)
+            if existing is not None and not self.table.is_deleted_rid(int(existing)):
+                return False
+    
             base_rid = self.table.alloc_base_rid()
             self.table.write_base_record(base_rid, row)
-
+    
             # register in every index that exists
             for c in range(self._num_cols):
                 if self.table.index.is_indexed(c):
                     self.table.index.insert_entry(c, int(row[c]), int(base_rid))
-
+    
             return True
         except Exception:
             return False
