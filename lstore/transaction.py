@@ -71,10 +71,11 @@ class Transaction:
             if len(args) < 1:
                 return ([], [])
             pk = int(args[0])
+            write_locks: List[Hashable] = [("PK", pk)]
             base_rid = self.table.key2rid.get(pk)
-            if base_rid is None:
-                return ([], [])
-            return ([], [int(base_rid)])
+            if base_rid is not None:
+                write_locks.append(int(base_rid))
+            return ([], write_locks)
 
         if name == "select":
             if len(args) < 2:
@@ -82,10 +83,11 @@ class Transaction:
             search_key = int(args[0])
             search_col = int(args[1])
             if search_col == self.table.key:
+                read_locks: List[Hashable] = [("PK", search_key)]
                 base_rid = self.table.key2rid.get(search_key)
-                if base_rid is None:
-                    return ([], [])
-                return ([int(base_rid)], [])
+                if base_rid is not None:
+                    read_locks.append(int(base_rid))
+                return (read_locks, [])
             return ([], [])
 
         return ([], [])
