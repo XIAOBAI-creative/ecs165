@@ -190,6 +190,8 @@ class Transaction:
                         t._latest_cache.pop(base_rid, None)
                     elif old_row is not None:
                         t._latest_cache[base_rid] = [int(v) for v in old_row]
+                        pk = int(old_row[t.key])
+                        t.key2rid[pk] = int(base_rid)
             except Exception:
                 pass
 
