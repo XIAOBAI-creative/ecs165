@@ -335,15 +335,12 @@ class Transaction:
             
                 # After a successful insert, lock the real base_rid
                 if undo is not None and undo.typ == "INSERT":
-                    try:
-                        pk = int(undo.payload["pk"])
-                        real_rid = self.table.key2rid.get(pk)
-                        if real_rid is not None:
-                            undo.base_rid = int(real_rid)
-                            self.lm.acquire_X(self.txn_id, int(real_rid))
-                    except Exception:
-                        pass
-            
+                    pk = int(undo.payload["pk"])
+                    real_rid = self.table.key2rid.get(pk)
+                    if real_rid is not None:
+                        undo.base_rid = int(real_rid)
+                        self.lm.acquire_X(self.txn_id, int(real_rid))
+                            
                 if undo is not None:
                     self._finalize_after_write(op, undo)
 
