@@ -310,17 +310,19 @@ class Transaction:
                 undo = None
                 if self._is_write_op(op):
                     undo = self._capture_before_write(op, args)
-
+                    if undo is not None:
+                        self._undo.append(undo)
+            
                 op_name = getattr(op, "__name__", "")
                 if op_name in ("select", "sum"):
                     result = op(*args, txn=self)
                 else:
                     result = op(*args)
-
+            
                 ok = (result is not False)
                 if not ok:
                     return self.abort()
-
+            
                 # After a successful insert, lock the real base_rid
                 if undo is not None and undo.typ == "INSERT":
                     try:
@@ -331,10 +333,9 @@ class Transaction:
                             self.lm.acquire_X(self.txn_id, int(real_rid))
                     except Exception:
                         pass
-
+            
                 if undo is not None:
                     self._finalize_after_write(op, undo)
-                    self._undo.append(undo)
 
             return self.commit()
         except LockConflict:
