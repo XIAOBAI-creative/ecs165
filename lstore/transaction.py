@@ -57,48 +57,48 @@ class Transaction:
     # ------------------------------------------------------------------
     # Lock planning
     # ------------------------------------------------------------------
-def _plan_locks(self, op: Callable[..., Any], args: Tuple[Any, ...]) -> Tuple[List[Hashable], List[Hashable]]:
-    assert self.table is not None
-    name = getattr(op, "__name__", "")
-
-    index_res = ("INDEX_ALL", self.table.name)
-
-    if name == "insert":
-        if len(args) <= self.table.key:
-            return ([], [])
-        pk = int(args[self.table.key])
-        return ([], [index_res, ("PK", pk)])
-
-    if name in ("update", "delete", "increment"):
-        if len(args) < 1:
-            return ([], [])
-        pk = int(args[0])
-        write_locks: List[Hashable] = [index_res, ("PK", pk)]
-        base_rid = self.table.key2rid.get(pk)
-        if base_rid is not None:
-            write_locks.append(int(base_rid))
-        return ([], write_locks)
-
-    if name == "select":
-        if len(args) < 2:
-            return ([], [])
-        search_key = int(args[0])
-        search_col = int(args[1])
-
-        if search_col == self.table.key:
-            read_locks: List[Hashable] = [("PK", search_key)]
-            base_rid = self.table.key2rid.get(search_key)
+    def _plan_locks(self, op: Callable[..., Any], args: Tuple[Any, ...]) -> Tuple[List[Hashable], List[Hashable]]:
+        assert self.table is not None
+        name = getattr(op, "__name__", "")
+    
+        index_res = ("INDEX_ALL", self.table.name)
+    
+        if name == "insert":
+            if len(args) <= self.table.key:
+                return ([], [])
+            pk = int(args[self.table.key])
+            return ([], [index_res, ("PK", pk)])
+    
+        if name in ("update", "delete", "increment"):
+            if len(args) < 1:
+                return ([], [])
+            pk = int(args[0])
+            write_locks: List[Hashable] = [index_res, ("PK", pk)]
+            base_rid = self.table.key2rid.get(pk)
             if base_rid is not None:
-                read_locks.append(int(base_rid))
-            return (read_locks, [])
-
-        # non-PK transactional reads must be protected from uncommitted index/key visibility changes
-        return ([index_res], [])
-
-    if name == "sum":
-        return ([index_res], [])
-
-    return ([], [])
+                write_locks.append(int(base_rid))
+            return ([], write_locks)
+    
+        if name == "select":
+            if len(args) < 2:
+                return ([], [])
+            search_key = int(args[0])
+            search_col = int(args[1])
+    
+            if search_col == self.table.key:
+                read_locks: List[Hashable] = [("PK", search_key)]
+                base_rid = self.table.key2rid.get(search_key)
+                if base_rid is not None:
+                    read_locks.append(int(base_rid))
+                return (read_locks, [])
+    
+            # non-PK transactional reads must be protected from uncommitted index/key visibility changes
+            return ([index_res], [])
+    
+        if name == "sum":
+            return ([index_res], [])
+    
+        return ([], [])
 
     # ------------------------------------------------------------------
     # Undo capture (before each write op)
