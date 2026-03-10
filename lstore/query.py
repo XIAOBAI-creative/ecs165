@@ -73,52 +73,52 @@ class Query:
                 except Exception:
                     pass
 
-def _rollback_update_local(
-    self,
-    base_rid: int,
-    old_row: List[int],
-    old_indirection: int,
-    old_schema: int,
-    new_row: Optional[List[int]] = None,
-) -> None:
-    try:
-        new_tail = int(self.table._base_latest_tail_rid(base_rid))
-    except Exception:
-        new_tail = 0
-
-    try:
-        self.table.overwrite_base_indirection(base_rid, int(old_indirection))
-    except Exception:
-        pass
-
-    try:
-        self.table.overwrite_base_schema(base_rid, int(old_schema))
-    except Exception:
-        pass
-
-    # 只删除“这次 update 新生成的 tail”
-    # 如果 current indirection 其实还是 old_indirection，
-    # 说明根本没有成功挂上新的 tail，绝对不能删旧 tail。
-    if new_tail != 0 and new_tail != int(old_indirection):
+    def _rollback_update_local(
+        self,
+        base_rid: int,
+        old_row: List[int],
+        old_indirection: int,
+        old_schema: int,
+        new_row: Optional[List[int]] = None,
+    ) -> None:
+        try:
+            new_tail = int(self.table._base_latest_tail_rid(base_rid))
+        except Exception:
+            new_tail = 0
+    
+        try:
+            self.table.overwrite_base_indirection(base_rid, int(old_indirection))
+        except Exception:
+            pass
+    
+        try:
+            self.table.overwrite_base_schema(base_rid, int(old_schema))
+        except Exception:
+            pass
+    
+        # 只删除“这次 update 新生成的 tail”
+        # 如果 current indirection 其实还是 old_indirection，
+        # 说明根本没有成功挂上新的 tail，绝对不能删旧 tail。
+        if new_tail != 0 and new_tail != int(old_indirection):
+            with self.table._meta_lock:
+                self.table._deleted.pop(int(new_tail), None)
+                self.table.page_directory.pop(int(new_tail), None)
+    
         with self.table._meta_lock:
-            self.table._deleted.pop(int(new_tail), None)
-            self.table.page_directory.pop(int(new_tail), None)
-
-    with self.table._meta_lock:
-        if not bool(self.table._deleted.get(int(base_rid), False)):
-            self.table._latest_cache[int(base_rid)] = [int(v) for v in old_row]
-
-    if new_row is not None:
-        for c in range(self._num_cols):
-            try:
-                if self.table.index.is_indexed(c):
-                    old_v = int(old_row[c])
-                    new_v = int(new_row[c])
-                    if old_v != new_v:
-                        self.table.index.delete_entry(c, new_v, int(base_rid))
-                        self.table.index.insert_entry(c, old_v, int(base_rid))
-            except Exception:
-                pass
+            if not bool(self.table._deleted.get(int(base_rid), False)):
+                self.table._latest_cache[int(base_rid)] = [int(v) for v in old_row]
+    
+        if new_row is not None:
+            for c in range(self._num_cols):
+                try:
+                    if self.table.index.is_indexed(c):
+                        old_v = int(old_row[c])
+                        new_v = int(new_row[c])
+                        if old_v != new_v:
+                            self.table.index.delete_entry(c, new_v, int(base_rid))
+                            self.table.index.insert_entry(c, old_v, int(base_rid))
+                except Exception:
+                    pass
     # ---- DELETE ----
 
     def delete(self, primary_key: int) -> bool:
