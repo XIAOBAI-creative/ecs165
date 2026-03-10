@@ -7,8 +7,10 @@ from lstore.lock_manager import LockConflict
 class Query:
     """
     Entry point for all database operations -- insert, delete, update, select, etc.
-    In Milestone 2, merge runs in the background. We don't trigger a full merge on
-    every query; write ops just try to apply one ready merge result along the way.
+    In Milestone 3:
+      - write locks are managed by Transaction
+      - read locks are acquired here on actual accessed RID(s)
+      - strict 2PL / no-wait conflicts must raise LockConflict in txn path
     """
 
     def __init__(self, table: Table):
@@ -28,14 +30,12 @@ class Query:
         if lm is None:
             return True
 
-        # 关键：
-        # 事务内读锁冲突必须抛 LockConflict，
-        # 不能吞掉然后 return False，
-        # 否则 transaction.run() 会把它当成 QUERY_FAIL 而不是 LOCK。
         lm.acquire_S(int(txn_id), ("RID", self.table.name, int(rid)))
         return True
 
-    # ---- local rollback helpers for statement-level safety ----
+    # -------------------------
+    # statement-local rollback helpers
+    # -------------------------
 
     def _rollback_insert_local(
         self,
@@ -44,6 +44,7 @@ class Query:
         old_existing: Optional[int] = None,
     ) -> None:
         pk = int(row[self._key_col])
+
         with self.table._meta_lock:
             self.table._deleted.pop(int(base_rid), None)
             self.table._latest_cache.pop(int(base_rid), None)
@@ -110,7 +111,6 @@ class Query:
         except Exception:
             pass
 
-        # 只删除这次 update 新生成的 tail，不能误删旧 tail
         if new_tail != 0 and new_tail != int(old_indirection):
             with self.table._meta_lock:
                 self.table._deleted.pop(int(new_tail), None)
@@ -132,19 +132,18 @@ class Query:
                 except Exception:
                     pass
 
-    # ---- DELETE ----
+    # -------------------------
+    # DELETE
+    # -------------------------
 
     def delete(self, primary_key: int) -> bool:
         try:
             pk = int(primary_key)
-            base_rid = self.table.key2rid.get(pk)
+            base_rid = self.table.get_base_rid_by_key(pk)
             if base_rid is None:
                 return False
 
             base_rid = int(base_rid)
-            if self.table.is_deleted_rid(base_rid):
-                return False
-
             old_row = self.table.read_latest_user_columns(base_rid)
             with self.table._meta_lock:
                 old_deleted = bool(self.table._deleted.get(base_rid, False))
@@ -169,7 +168,9 @@ class Query:
                 pass
             return False
 
-    # ---- INSERT ----
+    # -------------------------
+    # INSERT
+    # -------------------------
 
     def insert(self, *columns) -> bool:
         try:
@@ -208,7 +209,9 @@ class Query:
                 pass
             return False
 
-    # ---- SELECT (latest version) ----
+    # -------------------------
+    # SELECT (latest version)
+    # -------------------------
 
     def select(self, key: int, column: int, query_columns: List[int], txn=None):
         try:
@@ -226,7 +229,6 @@ class Query:
                     if self.table.is_deleted_rid(rid):
                         continue
 
-                    # 事务内这里如果锁冲突，会直接抛 LockConflict
                     self._acquire_shared_if_needed(txn, rid)
 
                     v = self.table.read_latest_user_value(rid, search_col)
@@ -254,15 +256,15 @@ class Query:
             return out
 
         except LockConflict:
-            # 关键：事务里要把 LockConflict 往外抛，
-            # 让 transaction.run() 识别为 LOCK abort 并重试。
             raise
         except Exception:
             if txn is not None:
                 return False
             return []
 
-    # ---- UPDATE ----
+    # -------------------------
+    # UPDATE
+    # -------------------------
 
     def update(self, key: int, *columns) -> bool:
         try:
@@ -272,13 +274,11 @@ class Query:
                 return False
 
             pk = int(key)
-            base_rid = self.table.key2rid.get(pk)
+            base_rid = self.table.get_base_rid_by_key(pk)
             if base_rid is None:
                 return False
 
             base_rid = int(base_rid)
-            if self.table.is_deleted_rid(base_rid):
-                return False
 
             cols: List[Optional[int]] = list(columns)
             old_row = self.table.read_latest_user_columns(base_rid)
@@ -310,7 +310,9 @@ class Query:
                 pass
             return False
 
-    # ---- SUM (latest version) ----
+    # -------------------------
+    # SUM (latest version)
+    # -------------------------
 
     def sum(self, start_range: int, end_range: int, aggregate_column_index: int, txn=None):
         try:
@@ -358,6 +360,10 @@ class Query:
             if txn is not None:
                 return False
             return 0
+
+    # -------------------------
+    # VERSIONED READS
+    # -------------------------
 
     def select_version(self, key: int, column: int, query_columns: List[int], relative_version: int):
         try:
@@ -429,16 +435,23 @@ class Query:
         except Exception:
             return 0
 
+    # -------------------------
+    # INCREMENT
+    # -------------------------
+
     def increment(self, key: int, column: int, txn=None) -> bool:
         try:
             recs = self.select(int(key), self._key_col, [1] * self._num_cols, txn=txn)
             if not recs:
                 return False
-    
+
             curr = recs[0].columns
             updated = [None] * self._num_cols
             updated[int(column)] = int(curr[int(column)]) + 1
-    
+
             return bool(self.update(int(key), *updated))
+
+        except LockConflict:
+            raise
         except Exception:
             return False
