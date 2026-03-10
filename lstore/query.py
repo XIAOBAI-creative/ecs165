@@ -23,11 +23,11 @@ class Query:
             txn_id = getattr(txn, "txn_id", None)
             if txn_id is None:
                 return True
-    
+
             lm = getattr(self.table, "lock_manager", None)
             if lm is None:
                 return True
-    
+
             lm.acquire_S(int(txn_id), ("RID", self.table.name, int(rid)))
             return True
         except LockConflict:
@@ -37,13 +37,16 @@ class Query:
 
     # ---- local rollback helpers for statement-level safety ----
 
-    def _rollback_insert_local(self, base_rid: int, row: List[int]) -> None:
+    def _rollback_insert_local(self, base_rid: int, row: List[int], old_existing: Optional[int] = None) -> None:
         pk = int(row[self._key_col])
         with self.table._meta_lock:
             self.table._deleted.pop(int(base_rid), None)
             self.table._latest_cache.pop(int(base_rid), None)
             if self.table.key2rid.get(pk) == int(base_rid):
-                self.table.key2rid.pop(pk, None)
+                if old_existing is None:
+                    self.table.key2rid.pop(pk, None)
+                else:
+                    self.table.key2rid[pk] = int(old_existing)
             self.table.page_directory.pop(int(base_rid), None)
             try:
                 self.table._base_rid_list.remove(int(base_rid))
@@ -85,29 +88,27 @@ class Query:
             new_tail = int(self.table._base_latest_tail_rid(base_rid))
         except Exception:
             new_tail = 0
-    
+
         try:
             self.table.overwrite_base_indirection(base_rid, int(old_indirection))
         except Exception:
             pass
-    
+
         try:
             self.table.overwrite_base_schema(base_rid, int(old_schema))
         except Exception:
             pass
-    
-        # 只删除“这次 update 新生成的 tail”
-        # 如果 current indirection 其实还是 old_indirection，
-        # 说明根本没有成功挂上新的 tail，绝对不能删旧 tail。
+
+        # 只删除这次 update 新生成的 tail，不能误删旧 tail
         if new_tail != 0 and new_tail != int(old_indirection):
             with self.table._meta_lock:
                 self.table._deleted.pop(int(new_tail), None)
                 self.table.page_directory.pop(int(new_tail), None)
-    
+
         with self.table._meta_lock:
             if not bool(self.table._deleted.get(int(base_rid), False)):
                 self.table._latest_cache[int(base_rid)] = [int(v) for v in old_row]
-    
+
         if new_row is not None:
             for c in range(self._num_cols):
                 try:
@@ -119,6 +120,7 @@ class Query:
                             self.table.index.insert_entry(c, old_v, int(base_rid))
                 except Exception:
                     pass
+
     # ---- DELETE ----
 
     def delete(self, primary_key: int) -> bool:
@@ -140,8 +142,10 @@ class Query:
             for c in range(self._num_cols):
                 if self.table.index.is_indexed(c):
                     self.table.index.delete_entry(c, int(old_row[c]), base_rid)
-            if self.table.key2rid.get(pk) == base_rid:
-                del self.table.key2rid[pk]
+
+            with self.table._meta_lock:
+                if self.table.key2rid.get(pk) == base_rid:
+                    del self.table.key2rid[pk]
 
             return True
         except Exception:
@@ -164,6 +168,8 @@ class Query:
             row = [int(x) for x in columns]
             pk = int(row[self._key_col])
             existing = self.table.key2rid.get(pk)
+            old_existing = None if existing is None else int(existing)
+
             if existing is not None and not self.table.is_deleted_rid(int(existing)):
                 return False
 
@@ -178,7 +184,11 @@ class Query:
         except Exception:
             try:
                 if 'base_rid' in locals() and 'row' in locals():
-                    self._rollback_insert_local(int(base_rid), list(row))
+                    self._rollback_insert_local(
+                        int(base_rid),
+                        list(row),
+                        old_existing if 'old_existing' in locals() else None,
+                    )
             except Exception:
                 pass
             return False
