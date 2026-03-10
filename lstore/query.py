@@ -215,7 +215,7 @@ class Query:
             search_col = int(column)
             search_val = int(key)
 
-            use_index = (txn is None and self.table.index.is_indexed(search_col))
+            use_index = self.table.index.is_indexed(search_col)
 
             if use_index:
                 rids = self.table.index.locate(search_col, search_val)
@@ -322,7 +322,7 @@ class Query:
 
             total = 0
             record_found = False
-            use_index = (txn is None and self.table.index.is_indexed(self._key_col))
+            use_index = self.table.index.is_indexed(self._key_col)
 
             if use_index:
                 rids = self.table.index.locate_range(start_k, end_k, self._key_col)
