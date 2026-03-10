@@ -273,6 +273,7 @@ class Transaction:
                 lm.acquire_X(self.txn_id, ("RID", table.name, int(base_rid)))
             return
 
+        # select / sum don't pre-lock; Query acquires S on accessed RID(s)
         return
 
     def _run_once(self) -> bool:
@@ -289,11 +290,8 @@ class Transaction:
                 if undo is not None:
                     self._undo.append(undo)
 
-            op_name = getattr(op, "__name__", "")
-            if op_name in ("select", "sum", "increment"):
-                result = op(*args, txn=self)
-            else:
-                result = op(*args)
+            # transaction mode: always pass txn=self
+            result = op(*args, txn=self)
 
             if result is False:
                 self._last_abort_reason = "QUERY_FAIL"
