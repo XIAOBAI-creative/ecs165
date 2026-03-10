@@ -6,11 +6,14 @@ from lstore.lock_manager import LockConflict
 
 class Query:
     """
-    Entry point for all database operations -- insert, delete, update, select, etc.
-    In Milestone 3:
+    Entry point for all database operations.
+
+    Milestone 3 design:
       - write locks are managed by Transaction
-      - read locks are acquired here on actual accessed RID(s)
-      - strict 2PL / no-wait conflicts must raise LockConflict in txn path
+      - read locks are acquired here on actually accessed RID(s)
+      - in txn mode, Query does NOT do local rollback; it raises and lets
+        Transaction.abort() handle atomic undo
+      - in non-txn mode, Query keeps local rollback as a safety net
     """
 
     def __init__(self, table: Table):
@@ -35,6 +38,7 @@ class Query:
 
     # -------------------------
     # statement-local rollback helpers
+    # only used for non-txn single-statement mode
     # -------------------------
 
     def _rollback_insert_local(
@@ -136,7 +140,7 @@ class Query:
     # DELETE
     # -------------------------
 
-    def delete(self, primary_key: int) -> bool:
+    def delete(self, primary_key: int, txn=None) -> bool:
         try:
             pk = int(primary_key)
             base_rid = self.table.get_base_rid_by_key(pk)
@@ -160,7 +164,11 @@ class Query:
 
             return True
 
+        except LockConflict:
+            raise
         except Exception:
+            if txn is not None:
+                raise
             try:
                 if "base_rid" in locals() and "old_row" in locals():
                     self._rollback_delete_local(int(base_rid), list(old_row), bool(old_deleted))
@@ -172,7 +180,7 @@ class Query:
     # INSERT
     # -------------------------
 
-    def insert(self, *columns) -> bool:
+    def insert(self, *columns, txn=None) -> bool:
         try:
             if len(columns) != self._num_cols:
                 return False
@@ -197,7 +205,11 @@ class Query:
 
             return True
 
+        except LockConflict:
+            raise
         except Exception:
+            if txn is not None:
+                raise
             try:
                 if "base_rid" in locals() and "row" in locals():
                     self._rollback_insert_local(
@@ -259,14 +271,14 @@ class Query:
             raise
         except Exception:
             if txn is not None:
-                return False
+                raise
             return []
 
     # -------------------------
     # UPDATE
     # -------------------------
 
-    def update(self, key: int, *columns) -> bool:
+    def update(self, key: int, *columns, txn=None) -> bool:
         try:
             if len(columns) != self._num_cols:
                 return False
@@ -296,7 +308,11 @@ class Query:
 
             return True
 
+        except LockConflict:
+            raise
         except Exception:
+            if txn is not None:
+                raise
             try:
                 if "base_rid" in locals() and "old_row" in locals():
                     self._rollback_update_local(
@@ -358,7 +374,7 @@ class Query:
             raise
         except Exception:
             if txn is not None:
-                return False
+                raise
             return 0
 
     # -------------------------
@@ -425,6 +441,7 @@ class Query:
                 if self.table.is_deleted_rid(rid):
                     continue
 
+                    # no txn path here, versioned read is outside M3 txn path
                 pk = int(self.table.read_latest_user_value(rid, self._key_col))
                 if start_k <= pk <= end_k:
                     total += int(self.table.read_relative_user_value(rid, c, steps_back))
@@ -449,9 +466,11 @@ class Query:
             updated = [None] * self._num_cols
             updated[int(column)] = int(curr[int(column)]) + 1
 
-            return bool(self.update(int(key), *updated))
+            return bool(self.update(int(key), *updated, txn=txn))
 
         except LockConflict:
             raise
         except Exception:
+            if txn is not None:
+                raise
             return False
