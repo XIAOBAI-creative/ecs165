@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple, Dict, Hashable
+from typing import Any, Callable, List, Optional, Tuple, Dict
 from contextlib import nullcontext
 import threading
 
@@ -35,7 +35,7 @@ class Transaction:
         self.table: Optional[Table] = None
         self.lm: Optional[LockManager] = None
         self._undo: List[UndoEntry] = []
-        self._last_abort_reason: Optional[str] = None  # "LOCK" | "QUERY_FAIL" | "EXCEPTION"
+        self._last_abort_reason: Optional[str] = None
 
     def add_query(self, query: Callable[..., Any], table: Table, *args) -> None:
         if not hasattr(table, "lock_manager") or getattr(table, "lock_manager") is None:
@@ -265,16 +265,14 @@ class Transaction:
                 return
             pk = int(args[0])
 
-            # 先锁 PK
+            # lock order: PK -> RID
             lm.acquire_X(self.txn_id, ("PK", table.name, pk))
 
-            # 再在持有 PK 锁的情况下解析当前 RID，并锁 RID
             base_rid = table.get_base_rid_by_key(pk)
             if base_rid is not None:
                 lm.acquire_X(self.txn_id, ("RID", table.name, int(base_rid)))
             return
 
-        # select / sum 不预锁，运行时由 query 按访问到的 RID 加 S 锁
         return
 
     def _run_once(self) -> bool:
