@@ -123,12 +123,15 @@ class Transaction:
             old_schema = int(self.table._base_schema(base_rid))
             # Also capture old user column values for reliable undo
             old_row = self.table.read_latest_user_columns(base_rid)
-            return UndoEntry(typ="UPDATE", base_rid=base_rid,
-                            payload={
-                                "old_indirection": old_ind,
-                                "old_schema": old_schema,
-                                "old_row": [int(v) for v in old_row],
-                            })
+            return UndoEntry(
+                typ="UPDATE",
+                base_rid=base_rid,
+                payload={
+                    "old_indirection": old_ind,
+                    "old_schema": old_schema,
+                    "old_row": [int(v) for v in old_row],
+                },
+            )
 
         if name == "delete":
             if len(args) < 1:
@@ -164,24 +167,25 @@ class Transaction:
             base_rid = int(undo.base_rid)
             pk = int(undo.payload["pk"])
             indexed = list(undo.payload.get("indexed", []))
-        
+
             try:
                 with self._meta_guard():
-                    t._deleted[base_rid] = True
+                    # Aborted insert should disappear rather than remain as a tombstone
+                    t._deleted.pop(base_rid, None)
                     t._latest_cache.pop(base_rid, None)
-        
+
                     if t.key2rid.get(pk) == base_rid:
                         t.key2rid.pop(pk, None)
-        
+
                     t.page_directory.pop(base_rid, None)
-        
+
                     try:
                         t._base_rid_list.remove(base_rid)
                     except ValueError:
                         pass
             except Exception:
                 pass
-        
+
             for (c, v) in indexed:
                 try:
                     t.index.delete_entry(int(c), int(v), int(base_rid))
@@ -322,17 +326,17 @@ class Transaction:
                     undo = self._capture_before_write(op, args)
                     if undo is not None:
                         self._undo.append(undo)
-            
+
                 op_name = getattr(op, "__name__", "")
                 if op_name in ("select", "sum"):
                     result = op(*args, txn=self)
                 else:
                     result = op(*args)
-            
+
                 ok = (result is not False)
                 if not ok:
                     return self.abort()
-            
+
                 # After a successful insert, lock the real base_rid
                 if undo is not None and undo.typ == "INSERT":
                     pk = int(undo.payload["pk"])
@@ -340,7 +344,7 @@ class Transaction:
                     if real_rid is not None:
                         undo.base_rid = int(real_rid)
                         self.lm.acquire_X(self.txn_id, int(real_rid))
-                            
+
                 if undo is not None:
                     self._finalize_after_write(op, undo)
 
