@@ -346,8 +346,12 @@ class Transaction:
                     # 只有当这次事务真的发布了一个新的 rid，才把 INSERT undo 入栈
                     if real_rid is not None and real_rid != old_existing:
                         undo.base_rid = int(real_rid)
-                        self.lm.acquire_X(self.txn_id, int(real_rid))
+                
+                        # 先登记 undo，再去拿 real_rid 的锁
+                        # 这样如果 acquire_X 失败并触发 abort，这次 insert 也能被正确回滚
                         self._undo.append(undo)
+                
+                        self.lm.acquire_X(self.txn_id, int(real_rid))
                             
                 if not ok:
                     return self.abort()
