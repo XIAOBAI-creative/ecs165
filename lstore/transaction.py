@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Dict, Hashable
 from contextlib import nullcontext
 import threading
-import time
 
 from lstore.table import Table
 from lstore.lock_manager import LockManager, LockConflict
@@ -12,12 +11,15 @@ from lstore.lock_manager import LockManager, LockConflict
 @dataclass
 class UndoEntry:
     typ: str  # "INSERT" | "UPDATE" | "DELETE"
+    table: Table
     base_rid: int
     payload: Dict[str, Any]
 
 
 _TXN_ID_LOCK = threading.Lock()
 _TXN_ID = 1
+
+
 def _next_txn_id() -> int:
     global _TXN_ID
     with _TXN_ID_LOCK:
@@ -28,28 +30,28 @@ def _next_txn_id() -> int:
 
 class Transaction:
     def __init__(self):
-        self.queries: List[Tuple[Callable[..., Any], Tuple[Any, ...]]] = []
+        self.queries: List[Tuple[Callable[..., Any], Table, Tuple[Any, ...]]] = []
         self.txn_id: int = _next_txn_id()
         self.table: Optional[Table] = None
         self.lm: Optional[LockManager] = None
         self._undo: List[UndoEntry] = []
 
     def add_query(self, query: Callable[..., Any], table: Table, *args) -> None:
+        if not hasattr(table, "lock_manager") or getattr(table, "lock_manager") is None:
+            setattr(table, "lock_manager", LockManager())
+
         if self.table is None:
             self.table = table
-            if not hasattr(table, "lock_manager") or getattr(table, "lock_manager") is None:
-                setattr(table, "lock_manager", LockManager())
             self.lm = getattr(table, "lock_manager")
-        self.queries.append((query, args))
+
+        self.queries.append((query, table, args))
 
     def _is_write_op(self, op: Callable[..., Any]) -> bool:
         name = getattr(op, "__name__", "")
         return name in ("insert", "update", "delete", "increment")
 
-    def _meta_guard(self):
-        if self.table is None:
-            return nullcontext()
-        lock = getattr(self.table, "_meta_lock", None)
+    def _meta_guard(self, table: Table):
+        lock = getattr(table, "_meta_lock", None)
         if lock is None:
             return nullcontext()
         return lock
@@ -57,88 +59,105 @@ class Transaction:
     # ------------------------------------------------------------------
     # Lock planning
     # ------------------------------------------------------------------
-    def _plan_locks(self, op: Callable[..., Any], args: Tuple[Any, ...]) -> Tuple[List[Hashable], List[Hashable]]:
-        assert self.table is not None
+    def _plan_locks(
+        self, table: Table, op: Callable[..., Any], args: Tuple[Any, ...]
+    ) -> Tuple[List[Hashable], List[Hashable]]:
         name = getattr(op, "__name__", "")
-    
-        # (key2rid, index, latest_cache, page_directory, etc.) from becoming visible.
-        table_res = ("TABLE_ALL", self.table.name)
-    
+
+        # safest M3 policy: table-level lock to protect shared structures
+        table_res = ("TABLE_ALL", table.name)
+
         if name == "insert":
-            if len(args) <= self.table.key:
+            if len(args) <= table.key:
                 return ([], [])
-            pk = int(args[self.table.key])
+            pk = int(args[table.key])
             return ([], [table_res, ("PK", pk)])
-    
+
         if name in ("update", "delete", "increment"):
             if len(args) < 1:
                 return ([], [table_res])
             pk = int(args[0])
             write_locks: List[Hashable] = [table_res, ("PK", pk)]
-            base_rid = self.table.key2rid.get(pk)
+            base_rid = table.key2rid.get(pk)
             if base_rid is not None:
                 write_locks.append(int(base_rid))
             return ([], write_locks)
-    
+
         if name == "select":
             if len(args) < 2:
                 return ([table_res], [])
             search_key = int(args[0])
             search_col = int(args[1])
-    
-            if search_col == self.table.key:
+
+            if search_col == table.key:
                 read_locks: List[Hashable] = [table_res, ("PK", search_key)]
-                base_rid = self.table.key2rid.get(search_key)
+                base_rid = table.key2rid.get(search_key)
                 if base_rid is not None:
                     read_locks.append(int(base_rid))
                 return (read_locks, [])
-    
+
             return ([table_res], [])
-    
+
         if name == "sum":
             return ([table_res], [])
-    
+
         return ([], [])
 
     # ------------------------------------------------------------------
     # Undo capture (before each write op)
     # ------------------------------------------------------------------
-    def _capture_before_write(self, op: Callable[..., Any], args: Tuple[Any, ...]) -> Optional[UndoEntry]:
-        assert self.table is not None
+    def _capture_before_write(
+        self, table: Table, op: Callable[..., Any], args: Tuple[Any, ...]
+    ) -> Optional[UndoEntry]:
         name = getattr(op, "__name__", "")
 
         if name == "insert":
-            if len(args) <= self.table.key:
+            if len(args) <= table.key:
                 return None
-            pk = int(args[self.table.key])
-            with self._meta_guard():
-                predicted_rid = int(getattr(self.table, "_next_base_rid", 0))
-        
-            # 在记录真正写入前先锁住将要使用的 base_rid
-            if self.lm is not None:
-                self.lm.acquire_X(self.txn_id, int(predicted_rid))
-        
+
+            pk = int(args[table.key])
+
+            with self._meta_guard(table):
+                predicted_rid = int(getattr(table, "_next_base_rid", 0))
+
+            # pre-lock the predicted base RID before publish
+            lm = getattr(table, "lock_manager", None)
+            if lm is not None:
+                lm.acquire_X(self.txn_id, int(predicted_rid))
+
             row = [int(x) for x in args]
-            indexed = [(c, int(row[c])) for c in range(self.table.num_columns) if self.table.index.is_indexed(c)]
-            old_existing = self.table.key2rid.get(pk)
+            indexed = [
+                (c, int(row[c]))
+                for c in range(table.num_columns)
+                if table.index.is_indexed(c)
+            ]
+            old_existing = table.key2rid.get(pk)
+
             return UndoEntry(
                 typ="INSERT",
+                table=table,
                 base_rid=predicted_rid,
-                payload={"pk": pk, "indexed": indexed, "old_existing": old_existing},
+                payload={
+                    "pk": pk,
+                    "indexed": indexed,
+                    "old_existing": old_existing,
+                },
             )
 
         if name in ("update", "increment"):
             pk = int(args[0])
-            base_rid = self.table.key2rid.get(pk)
+            base_rid = table.key2rid.get(pk)
             if base_rid is None:
                 return None
+
             base_rid = int(base_rid)
-            old_ind = int(self.table._base_latest_tail_rid(base_rid))
-            old_schema = int(self.table._base_schema(base_rid))
-            # Also capture old user column values for reliable undo
-            old_row = self.table.read_latest_user_columns(base_rid)
+            old_ind = int(table._base_latest_tail_rid(base_rid))
+            old_schema = int(table._base_schema(base_rid))
+            old_row = table.read_latest_user_columns(base_rid)
+
             return UndoEntry(
                 typ="UPDATE",
+                table=table,
                 base_rid=base_rid,
                 payload={
                     "old_indirection": old_ind,
@@ -150,18 +169,26 @@ class Transaction:
         if name == "delete":
             if len(args) < 1:
                 return None
+
             pk = int(args[0])
-            base_rid = self.table.key2rid.get(pk)
+            base_rid = table.key2rid.get(pk)
             if base_rid is None:
                 return None
+
             base_rid = int(base_rid)
-            old_row = self.table.read_latest_user_columns(base_rid)
-            with self._meta_guard():
-                old_deleted = bool(self.table._deleted.get(base_rid, False))
+            old_row = table.read_latest_user_columns(base_rid)
+
+            with self._meta_guard(table):
+                old_deleted = bool(table._deleted.get(base_rid, False))
+
             return UndoEntry(
                 typ="DELETE",
+                table=table,
                 base_rid=base_rid,
-                payload={"old_deleted": old_deleted, "old_row": old_row},
+                payload={
+                    "old_deleted": old_deleted,
+                    "old_row": old_row,
+                },
             )
 
         return None
@@ -174,8 +201,7 @@ class Transaction:
     # Undo application
     # ------------------------------------------------------------------
     def _apply_undo(self, undo: UndoEntry) -> None:
-        assert self.table is not None
-        t = self.table
+        t = undo.table
 
         if undo.typ == "INSERT":
             base_rid = int(undo.base_rid)
@@ -183,8 +209,7 @@ class Transaction:
             indexed = list(undo.payload.get("indexed", []))
 
             try:
-                with self._meta_guard():
-                    # Aborted insert should disappear rather than remain as a tombstone
+                with self._meta_guard(t):
                     t._deleted.pop(base_rid, None)
                     t._latest_cache.pop(base_rid, None)
 
@@ -213,7 +238,7 @@ class Transaction:
             old_row = undo.payload.get("old_row", None)
 
             try:
-                with self._meta_guard():
+                with self._meta_guard(t):
                     t._deleted[base_rid] = old_deleted
                     if old_deleted:
                         t._latest_cache.pop(base_rid, None)
@@ -238,58 +263,49 @@ class Transaction:
             base_rid = int(undo.base_rid)
             old_ind = int(undo.payload["old_indirection"])
             old_schema = int(undo.payload["old_schema"])
-            # old_row was captured before the write - this is the ground truth
             old_row = undo.payload.get("old_row")
 
-            # Read current (new) values for index rollback
             try:
                 new_row = t.read_latest_user_columns(base_rid)
             except Exception:
                 new_row = None
 
-            # Get the tail rid that our write created
             try:
                 new_tail = int(t._base_latest_tail_rid(base_rid))
             except Exception:
                 new_tail = 0
 
-            # Restore base record metadata to pre-write state
             try:
                 t.overwrite_base_indirection(base_rid, old_ind)
             except Exception:
                 pass
+
             try:
                 t.overwrite_base_schema(base_rid, old_schema)
             except Exception:
                 pass
 
-            # Remove the tail record we created so abort gets closer to the exact initial state
             if new_tail != 0:
                 try:
-                    with self._meta_guard():
+                    with self._meta_guard(t):
                         t._deleted.pop(int(new_tail), None)
                         t.page_directory.pop(int(new_tail), None)
                 except Exception:
                     pass
 
-            # Restore cache directly from captured old_row (don't re-read!)
-            # This avoids the stale-cache bug entirely: we KNOW what the
-            # old values were because we captured them before the write.
             if old_row is not None:
-                with self._meta_guard():
+                with self._meta_guard(t):
                     t._latest_cache[base_rid] = [int(v) for v in old_row]
             else:
-                # Fallback: invalidate cache and re-read
-                with self._meta_guard():
+                with self._meta_guard(t):
                     t._latest_cache.pop(base_rid, None)
                 try:
                     restored = t.read_latest_user_columns(base_rid)
-                    with self._meta_guard():
+                    with self._meta_guard(t):
                         t._latest_cache[base_rid] = [int(v) for v in restored]
                 except Exception:
                     pass
 
-            # Rollback index entries
             if old_row is not None and new_row is not None:
                 for c in range(t.num_columns):
                     if t.index.is_indexed(c):
@@ -307,62 +323,78 @@ class Transaction:
     # Transaction execution
     # ------------------------------------------------------------------
     def run(self) -> bool:
-        if self.table is None:
+        if not self.queries:
             return True
-        self._undo.clear()
-        try:
-            # Phase 1: Collect ALL lock requirements from ALL queries,
-            # then acquire in one pass. If a resource needs both S and X,
-            # promote to X only. This prevents the S->X upgrade deadlock
-            # where two txns both hold S and neither can upgrade.
-            all_read: set = set()
-            all_write: set = set()
-            for (op, args) in self.queries:
-                read_res, write_res = self._plan_locks(op, args)
-                for r in read_res:
-                    all_read.add(r)
-                for r in write_res:
-                    all_write.add(r)
 
-            # Promote overlapping S+X to X only
-            all_read -= all_write
+        self._undo.clear()
+
+        # collect all lock managers touched by this transaction
+        lock_managers: List[LockManager] = []
+        seen_lms = set()
+        for (_, table, _) in self.queries:
+            lm = getattr(table, "lock_manager", None)
+            if lm is None:
+                setattr(table, "lock_manager", LockManager())
+                lm = getattr(table, "lock_manager")
+            if id(lm) not in seen_lms:
+                seen_lms.add(id(lm))
+                lock_managers.append(lm)
+
+        try:
+            # Phase 1: Collect ALL lock requirements from ALL queries
+            all_read: List[Tuple[LockManager, Hashable]] = []
+            all_write: List[Tuple[LockManager, Hashable]] = []
+
+            for (op, table, args) in self.queries:
+                lm = getattr(table, "lock_manager")
+                read_res, write_res = self._plan_locks(table, op, args)
+
+                for r in read_res:
+                    all_read.append((lm, r))
+                for r in write_res:
+                    all_write.append((lm, r))
+
+            # remove S locks that are also requested as X on the same lock manager/resource
+            write_set = {(id(lm), r) for (lm, r) in all_write}
+            filtered_read = []
+            for (lm, r) in all_read:
+                if (id(lm), r) not in write_set:
+                    filtered_read.append((lm, r))
 
             # Acquire X first, then S
-            for r in all_write:
-                self.lm.acquire_X(self.txn_id, r)
-            for r in all_read:
-                self.lm.acquire_S(self.txn_id, r)
+            for (lm, r) in all_write:
+                lm.acquire_X(self.txn_id, r)
+            for (lm, r) in filtered_read:
+                lm.acquire_S(self.txn_id, r)
 
             # Phase 2: Execute all queries
-            for (op, args) in self.queries:
+            for (op, table, args) in self.queries:
                 undo = None
+
                 if self._is_write_op(op):
-                    undo = self._capture_before_write(op, args)
-                    # INSERT 不能提前按 predicted_rid 入栈
+                    undo = self._capture_before_write(table, op, args)
                     if undo is not None and undo.typ != "INSERT":
                         self._undo.append(undo)
-            
+
                 op_name = getattr(op, "__name__", "")
                 if op_name in ("select", "sum"):
                     result = op(*args, txn=self)
                 else:
                     result = op(*args)
-            
+
                 ok = (result is not False)
-            
-                # INSERT 要在执行后，拿到真实 rid，再决定是否入栈
+
                 if undo is not None and undo.typ == "INSERT":
-                    # INSERT 的 rid 已经在 _capture_before_write 里预锁，
-                    # 这里直接登记 undo 即可
                     self._undo.append(undo)
-                
+
                 if not ok:
                     return self.abort()
-            
+
                 if undo is not None:
                     self._finalize_after_write(op, undo)
 
             return self.commit()
+
         except LockConflict:
             return self.abort()
         except Exception:
@@ -373,11 +405,19 @@ class Transaction:
             for i in range(len(self._undo) - 1, -1, -1):
                 self._apply_undo(self._undo[i])
         finally:
-            if self.lm is not None:
-                self.lm.release_all(self.txn_id)
+            released = set()
+            for (_, table, _) in self.queries:
+                lm = getattr(table, "lock_manager", None)
+                if lm is not None and id(lm) not in released:
+                    released.add(id(lm))
+                    lm.release_all(self.txn_id)
         return False
 
     def commit(self) -> bool:
-        if self.lm is not None:
-            self.lm.release_all(self.txn_id)
+        released = set()
+        for (_, table, _) in self.queries:
+            lm = getattr(table, "lock_manager", None)
+            if lm is not None and id(lm) not in released:
+                released.add(id(lm))
+                lm.release_all(self.txn_id)
         return True
