@@ -97,6 +97,7 @@ class Transaction:
             pk = int(row[table.key])
             with self._meta_guard(table):
                 predicted_rid = int(getattr(table, "_next_base_rid", 0))
+            old_existing = table.key2rid.get(pk)
             return UndoEntry(
                 typ="INSERT",
                 table=table,
@@ -104,6 +105,7 @@ class Transaction:
                 payload={
                     "pk": pk,
                     "row": row,
+                    "old_existing": None if old_existing is None else int(old_existing),
                 },
             )
 
@@ -162,12 +164,16 @@ class Transaction:
             if not row:
                 return
             pk = int(undo.payload["pk"])
+            old_existing = undo.payload.get("old_existing", None)
 
             with self._meta_guard(t):
                 t._deleted.pop(base_rid, None)
                 t._latest_cache.pop(base_rid, None)
                 if t.key2rid.get(pk) == base_rid:
-                    t.key2rid.pop(pk, None)
+                    if old_existing is None:
+                        t.key2rid.pop(pk, None)
+                    else:
+                        t.key2rid[pk] = int(old_existing)
                 t.page_directory.pop(base_rid, None)
                 try:
                     t._base_rid_list.remove(base_rid)
