@@ -1,161 +1,101 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Set, Hashable
+from collections import defaultdict
 import threading
 
 
 class LockConflict(Exception):
-    # no-wait冲突时抛出
     pass
-
-
-@dataclass
-class _LockState:
-    # 当前锁模式
-    mode: str = "UNLOCKED"  # "UNLOCKED" | "S" | "X"
-    # 排它锁持有（mode X）
-    x_owner: Optional[int] = None
-    # 共享锁持有集合（mode S）
-    s_owners: Set[int] = field(default_factory=set)
-
-    # txn 的持有次数（可重入 / 幂等）
-    s_count: Dict[int, int] = field(default_factory=dict)
-    x_count: Dict[int, int] = field(default_factory=dict)
 
 
 class LockManager:
     """
-    2PL + No-Wait 锁管理器
+    Strict no-wait 2PL lock manager.
 
-    对于 INSERT，因为记录还不存在，没有 baseRID，这里用虚拟资源
-    ("PK", table_name, pk_value) 来避免同一个主键被并发插入导致重复。
+    Resource examples:
+      ("PK", table_name, pk)
+      ("RID", table_name, base_rid)
 
-    acquire_S / acquire_X：
-      1. no-wait：一旦冲突立刻 LockConflict（不等待）
-      2. 可重入（同一 txn 对同一资源重复 acquire）
-      3. S -> X：只有该资源的共享锁仅被当前 txn 持有时才允许升级
-
-    release_all：
-      strict 2PL：只能在 commit/abort 时统一释放，中途不释放
+    Semantics:
+      - S conflicts with another txn's X
+      - X conflicts with another txn's S/X
+      - same txn re-entrant acquire succeeds
+      - S -> X upgrade succeeds only if no other txn holds S/X
+      - no waiting: conflict => raise LockConflict immediately
     """
 
     def __init__(self):
-        # 全局互斥，保护 lock table 的并发访问
-        self._mu = threading.RLock()
-        # lock table：resource_id -> LockState
-        self._locks: Dict[Hashable, _LockState] = {}
-        # 事务持有的资源集合：txn_id -> set(resource_id)，方便 release_all
-        self._txn_resources: Dict[int, Set[Hashable]] = {}
+        self._lock = threading.RLock()
 
-    def acquire_S(self, txn_id: int, rid: Hashable) -> None:
-        # 申请共享锁 S，冲突则 LockConflict
-        with self._mu:
-            st = self._locks.get(rid)
-            if st is None:
-                st = _LockState()
-                self._locks[rid] = st
+        # resource -> set(txn_id)
+        self._shared_holders = defaultdict(set)
 
-            # 如果当前是 X 锁：
-            # 自己持有 X：允许（可重入），同时也可记录 S 计数
-            # 别人持有 X：冲突，no-wait 失败
-            if st.mode == "X":
-                if st.x_owner == txn_id:
-                    st.s_owners.add(txn_id)
-                    st.s_count[txn_id] = st.s_count.get(txn_id, 0) + 1
-                    self._txn_resources.setdefault(txn_id, set()).add(rid)
-                    return
+        # resource -> txn_id
+        self._exclusive_holder = {}
+
+        # txn_id -> set(resource)
+        self._txn_to_resources = defaultdict(set)
+
+    def acquire_S(self, txn_id: int, resource) -> None:
+        txn_id = int(txn_id)
+        with self._lock:
+            x_holder = self._exclusive_holder.get(resource)
+
+            # another txn already holds X
+            if x_holder is not None and x_holder != txn_id:
                 raise LockConflict()
 
-            # UNLOCKED 或 S：可共享
-            if st.mode in ("UNLOCKED", "S"):
-                st.mode = "S"
-                st.s_owners.add(txn_id)
-                st.s_count[txn_id] = st.s_count.get(txn_id, 0) + 1
-                self._txn_resources.setdefault(txn_id, set()).add(rid)
+            # same txn re-entrant S is fine
+            self._shared_holders[resource].add(txn_id)
+            self._txn_to_resources[txn_id].add(resource)
+
+    def acquire_X(self, txn_id: int, resource) -> None:
+        txn_id = int(txn_id)
+        with self._lock:
+            x_holder = self._exclusive_holder.get(resource)
+            s_holders = self._shared_holders.get(resource, set())
+
+            # same txn already holds X
+            if x_holder == txn_id:
+                self._txn_to_resources[txn_id].add(resource)
                 return
 
-            raise LockConflict()
-
-    def acquire_X(self, txn_id: int, rid: Hashable) -> None:
-        # 申请排它锁 X，冲突则 LockConflict，同时支持 S -> X
-        with self._mu:
-            st = self._locks.get(rid)
-            if st is None:
-                st = _LockState()
-                self._locks[rid] = st
-
-            # 资源空闲则直接 X
-            if st.mode == "UNLOCKED":
-                st.mode = "X"
-                st.x_owner = txn_id
-                st.x_count[txn_id] = st.x_count.get(txn_id, 0) + 1
-                self._txn_resources.setdefault(txn_id, set()).add(rid)
-                return
-
-            # 已经是 X
-            if st.mode == "X":
-                # 自己持有：可重入
-                if st.x_owner == txn_id:
-                    st.x_count[txn_id] = st.x_count.get(txn_id, 0) + 1
-                    self._txn_resources.setdefault(txn_id, set()).add(rid)
-                    return
-                # 别人持有：冲突
+            # another txn holds X
+            if x_holder is not None and x_holder != txn_id:
                 raise LockConflict()
 
-            # 当前是 S：尝试升级到 X
-            if st.mode == "S":
-                # 条件：共享锁持有者只有自己
-                if st.s_owners == {txn_id}:
-                    st.s_owners.discard(txn_id)
-                    st.s_count.pop(txn_id, None)
-                    st.mode = "X"
-                    st.x_owner = txn_id
-                    st.x_count[txn_id] = st.x_count.get(txn_id, 0) + 1
-                    self._txn_resources.setdefault(txn_id, set()).add(rid)
-                    return
+            # any other txn holds S
+            for holder in s_holders:
+                if holder != txn_id:
+                    raise LockConflict()
 
-                # 其他 txn 也持有 S，no-wait 直接失败
-                raise LockConflict()
+            # upgrade or fresh X
+            self._exclusive_holder[resource] = txn_id
 
-            raise LockConflict()
+            # if same txn previously had S, remove it from S set
+            if txn_id in self._shared_holders.get(resource, set()):
+                self._shared_holders[resource].discard(txn_id)
+                if not self._shared_holders[resource]:
+                    self._shared_holders.pop(resource, None)
+
+            self._txn_to_resources[txn_id].add(resource)
 
     def release_all(self, txn_id: int) -> None:
-        """
-        释放某个事务持有的全部锁。strict 2PL 下只在 commit/abort 调用。
+        txn_id = int(txn_id)
+        with self._lock:
+            resources = list(self._txn_to_resources.get(txn_id, set()))
 
-        注意：事务可能对同一 rid 重复 acquire，会导致 s_count/x_count > 1，
-        但 txn_resources 只是 set。release_all 这里必须清空该 txn 在该 rid 上
-        的所有持有，而不是只减 1。
-        """
-        with self._mu:
-            resources = self._txn_resources.pop(txn_id, set())
-            for rid in list(resources):
-                st = self._locks.get(rid)
-                if st is None:
-                    continue
+            for resource in resources:
+                s_holders = self._shared_holders.get(resource)
+                if s_holders is not None:
+                    s_holders.discard(txn_id)
+                    if not s_holders:
+                        self._shared_holders.pop(resource, None)
 
-                # 清掉该 txn 的 X
-                if st.x_owner == txn_id:
-                    st.x_owner = None
-                st.x_count.pop(txn_id, None)
+                if self._exclusive_holder.get(resource) == txn_id:
+                    self._exclusive_holder.pop(resource, None)
 
-                # 清掉该 txn 的 S
-                st.s_owners.discard(txn_id)
-                st.s_count.pop(txn_id, None)
+            self._txn_to_resources.pop(txn_id, None)
 
-                # 重算 mode
-                if st.x_owner is None:
-                    st.mode = "S" if st.s_owners else "UNLOCKED"
-                else:
-                    st.mode = "X"
-
-                # 完全空闲则移除
-                if st.mode == "UNLOCKED" and not st.s_owners and st.x_owner is None:
-                    self._locks.pop(rid, None)
-
-    def has_x_lock(self, rid: Hashable) -> bool:
-        with self._mu:
-            st = self._locks.get(rid)
-            if st is None:
-                return False
-            return st.mode == "X" and st.x_owner is not None
+    def has_x_lock(self, resource) -> bool:
+        with self._lock:
+            return resource in self._exclusive_holder
