@@ -11,16 +11,16 @@ class LockManager:
     """
     Strict no-wait 2PL lock manager.
 
-    Resource examples:
+    Resources:
       ("PK", table_name, pk)
       ("RID", table_name, base_rid)
 
-    Semantics:
+    Rules:
       - S conflicts with another txn's X
       - X conflicts with another txn's S/X
       - same txn re-entrant acquire succeeds
-      - S -> X upgrade succeeds only if no other txn holds S/X
-      - no waiting: conflict => raise LockConflict immediately
+      - S->X upgrade succeeds only if no other txn holds S/X
+      - no waiting: any conflict raises LockConflict immediately
     """
 
     def __init__(self):
@@ -44,7 +44,7 @@ class LockManager:
             if x_holder is not None and x_holder != txn_id:
                 raise LockConflict()
 
-            # same txn re-entrant S is fine
+            # same txn re-entrant S is allowed
             self._shared_holders[resource].add(txn_id)
             self._txn_to_resources[txn_id].add(resource)
 
@@ -63,15 +63,15 @@ class LockManager:
             if x_holder is not None and x_holder != txn_id:
                 raise LockConflict()
 
-            # any other txn holds S
+            # another txn holds S
             for holder in s_holders:
                 if holder != txn_id:
                     raise LockConflict()
 
-            # upgrade or fresh X
+            # upgrade / fresh X
             self._exclusive_holder[resource] = txn_id
 
-            # if same txn previously had S, remove it from S set
+            # if same txn previously had S, clear it from S-holders
             if txn_id in self._shared_holders.get(resource, set()):
                 self._shared_holders[resource].discard(txn_id)
                 if not self._shared_holders[resource]:
