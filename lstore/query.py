@@ -17,7 +17,6 @@ class Query:
         self._key_col = table.key
 
     def _acquire_shared_if_needed(self, txn, rid: int) -> bool:
-        """Try to grab a shared lock for reads on this table. If we can't get it, there's a conflict."""
         if txn is None:
             return True
         try:
@@ -36,10 +35,90 @@ class Query:
         except Exception:
             return False
 
+    # ---- local rollback helpers for statement-level safety ----
+
+    def _rollback_insert_local(self, base_rid: int, row: List[int]) -> None:
+        pk = int(row[self._key_col])
+        with self.table._meta_lock:
+            self.table._deleted.pop(int(base_rid), None)
+            self.table._latest_cache.pop(int(base_rid), None)
+            if self.table.key2rid.get(pk) == int(base_rid):
+                self.table.key2rid.pop(pk, None)
+            self.table.page_directory.pop(int(base_rid), None)
+            try:
+                self.table._base_rid_list.remove(int(base_rid))
+            except ValueError:
+                pass
+        for c in range(self._num_cols):
+            try:
+                if self.table.index.is_indexed(c):
+                    self.table.index.delete_entry(c, int(row[c]), int(base_rid))
+            except Exception:
+                pass
+
+    def _rollback_delete_local(self, base_rid: int, old_row: List[int], old_deleted: bool) -> None:
+        pk = int(old_row[self._key_col])
+        with self.table._meta_lock:
+            self.table._deleted[int(base_rid)] = bool(old_deleted)
+            if old_deleted:
+                self.table._latest_cache.pop(int(base_rid), None)
+            else:
+                self.table.key2rid[pk] = int(base_rid)
+                self.table._latest_cache[int(base_rid)] = [int(v) for v in old_row]
+        if not old_deleted:
+            for c in range(self._num_cols):
+                try:
+                    if self.table.index.is_indexed(c):
+                        self.table.index.insert_entry(c, int(old_row[c]), int(base_rid))
+                except Exception:
+                    pass
+
+    def _rollback_update_local(
+        self,
+        base_rid: int,
+        old_row: List[int],
+        old_indirection: int,
+        old_schema: int,
+        new_row: Optional[List[int]] = None,
+    ) -> None:
+        try:
+            new_tail = int(self.table._base_latest_tail_rid(base_rid))
+        except Exception:
+            new_tail = 0
+
+        try:
+            self.table.overwrite_base_indirection(base_rid, int(old_indirection))
+        except Exception:
+            pass
+        try:
+            self.table.overwrite_base_schema(base_rid, int(old_schema))
+        except Exception:
+            pass
+
+        if new_tail != 0:
+            with self.table._meta_lock:
+                self.table._deleted.pop(int(new_tail), None)
+                self.table.page_directory.pop(int(new_tail), None)
+
+        with self.table._meta_lock:
+            if not bool(self.table._deleted.get(int(base_rid), False)):
+                self.table._latest_cache[int(base_rid)] = [int(v) for v in old_row]
+
+        if new_row is not None:
+            for c in range(self._num_cols):
+                try:
+                    if self.table.index.is_indexed(c):
+                        old_v = int(old_row[c])
+                        new_v = int(new_row[c])
+                        if old_v != new_v:
+                            self.table.index.delete_entry(c, new_v, int(base_rid))
+                            self.table.index.insert_entry(c, old_v, int(base_rid))
+                except Exception:
+                    pass
+
     # ---- DELETE ----
 
     def delete(self, primary_key: int) -> bool:
-        """Delete a record by primary key. Also cleans up index entries."""
         try:
             pk = int(primary_key)
             base_rid = self.table.key2rid.get(pk)
@@ -49,13 +128,12 @@ class Query:
             if self.table.is_deleted_rid(base_rid):
                 return False
 
-            # grab old values first -- we need them to remove index entries
             old_row = self.table.read_latest_user_columns(base_rid)
+            with self.table._meta_lock:
+                old_deleted = bool(self.table._deleted.get(base_rid, False))
 
-            # mark it as deleted
             self.table.mark_deleted(base_rid)
 
-            # clean up index entries for every indexed column
             for c in range(self._num_cols):
                 if self.table.index.is_indexed(c):
                     self.table.index.delete_entry(c, int(old_row[c]), base_rid)
@@ -64,22 +142,23 @@ class Query:
 
             return True
         except Exception:
+            try:
+                if 'base_rid' in locals() and 'old_row' in locals():
+                    self._rollback_delete_local(int(base_rid), list(old_row), bool(old_deleted))
+            except Exception:
+                pass
             return False
 
     # ---- INSERT ----
 
     def insert(self, *columns) -> bool:
-        """Insert a new record. Column count must match, and no None values allowed."""
         try:
             if len(columns) != self._num_cols:
                 return False
-
-            # NULLs not allowed on insert
             if any(v is None for v in columns):
                 return False
 
             row = [int(x) for x in columns]
-
             pk = int(row[self._key_col])
             existing = self.table.key2rid.get(pk)
             if existing is not None and not self.table.is_deleted_rid(int(existing)):
@@ -88,32 +167,27 @@ class Query:
             base_rid = self.table.alloc_base_rid()
             self.table.write_base_record(base_rid, row)
 
-            # register in every index that exists
             for c in range(self._num_cols):
                 if self.table.index.is_indexed(c):
                     self.table.index.insert_entry(c, int(row[c]), int(base_rid))
 
             return True
         except Exception:
+            try:
+                if 'base_rid' in locals() and 'row' in locals():
+                    self._rollback_insert_local(int(base_rid), list(row))
+            except Exception:
+                pass
             return False
 
     # ---- SELECT (latest version) ----
 
     def select(self, key: int, column: int, query_columns: List[int], txn=None):
-        """
-        Find records where the given column equals key, return latest version.
-        query_columns is a bitmask for which columns to include in the result.
-        """
         try:
             search_col = int(column)
             search_val = int(key)
 
-            # If running inside a transaction and the search column is NOT the primary key,
-            # we avoid using the secondary index to prevent reading uncommitted updates.
-            use_index = (
-                txn is None and
-                self.table.index.is_indexed(search_col)
-            )
+            use_index = (txn is None and self.table.index.is_indexed(search_col))
 
             if use_index:
                 rids = self.table.index.locate(search_col, search_val)
@@ -121,31 +195,23 @@ class Query:
                 rids = []
                 for rid in self.table.all_base_rids():
                     rid = int(rid)
-
                     if self.table.is_deleted_rid(rid):
                         continue
-
-                    # acquire S lock when in a transaction
                     if not self._acquire_shared_if_needed(txn, rid):
                         return False
-
                     v = self.table.read_latest_user_value(rid, search_col)
-
                     if int(v) == search_val:
                         rids.append(rid)
 
-            # now build the result set from the matching rids
             out: List[Record] = []
             for rid in rids:
                 rid = int(rid)
                 if self.table.is_deleted_rid(rid):
                     continue
-                # lock before reading
                 if not self._acquire_shared_if_needed(txn, rid):
                     return False
                 latest = self.table.read_latest_user_columns(rid)
 
-                # project -- only keep the columns the caller asked for
                 projected: List[Optional[int]] = [None] * self._num_cols
                 for i, take in enumerate(query_columns):
                     if take:
@@ -162,12 +228,9 @@ class Query:
     # ---- UPDATE ----
 
     def update(self, key: int, *columns) -> bool:
-        """Update a record. None means 'don't change this column'. Can't change the primary key."""
         try:
             if len(columns) != self._num_cols:
                 return False
-
-            # can't change the primary key
             if columns[self._key_col] is not None:
                 return False
 
@@ -180,14 +243,12 @@ class Query:
                 return False
 
             cols: List[Optional[int]] = list(columns)
-
-            # save old values -- need them to update index later
             old_row = self.table.read_latest_user_columns(base_rid)
+            old_indirection = int(self.table._base_latest_tail_rid(base_rid))
+            old_schema = int(self.table._base_schema(base_rid))
 
-            # write a tail record and update base metadata pointers
             self.table.apply_update(base_rid, cols, prev_latest=old_row)
 
-            # read back the new values and move index entries accordingly
             new_row = list(old_row)
             for i, v in enumerate(cols):
                 if v is not None:
@@ -196,12 +257,22 @@ class Query:
 
             return True
         except Exception:
+            try:
+                if 'base_rid' in locals() and 'old_row' in locals():
+                    self._rollback_update_local(
+                        int(base_rid),
+                        [int(v) for v in old_row],
+                        int(old_indirection),
+                        int(old_schema),
+                        new_row if 'new_row' in locals() else None,
+                    )
+            except Exception:
+                pass
             return False
 
     # ---- SUM (latest version) ----
 
     def sum(self, start_range: int, end_range: int, aggregate_column_index: int, txn=None):
-        """Sum up a column for all records whose primary key falls in [start, end]."""
         try:
             start_k = int(start_range)
             end_k = int(end_range)
@@ -211,12 +282,7 @@ class Query:
 
             total = 0
             record_found = False
-
-            # if there's an index on the key column, use range lookup -- way faster
-            use_index = (
-                txn is None and
-                self.table.index.is_indexed(self._key_col)
-            )
+            use_index = (txn is None and self.table.index.is_indexed(self._key_col))
 
             if use_index:
                 rids = self.table.index.locate_range(start_k, end_k, self._key_col)
@@ -230,7 +296,6 @@ class Query:
                     record_found = True
                 return int(total) if record_found else False
 
-            # no index, fall back to scanning everything
             for rid in self.table.all_base_rids():
                 rid = int(rid)
                 if self.table.is_deleted_rid(rid):
@@ -248,10 +313,7 @@ class Query:
                 return False
             return 0
 
-    # ---- SELECT VERSION (read a past version) ----
-
     def select_version(self, key: int, column: int, query_columns: List[int], relative_version: int):
-        """Same idea as select, but goes back in history. relative_version says how many steps back."""
         try:
             search_col = int(column)
             search_val = int(key)
@@ -260,13 +322,12 @@ class Query:
             if self.table.index.is_indexed(search_col):
                 rids = self.table.index.locate(search_col, search_val)
             else:
-                # no index -- scan and match against the historical value
                 rids = []
                 for rid in self.table.all_base_rids():
                     rid = int(rid)
                     if self.table.is_deleted_rid(rid):
                         continue
-                    v = self.table.read_relative_user_value(rid, search_col, steps_back)
+                    v = self.table.read_latest_user_value(rid, search_col)
                     if int(v) == search_val:
                         rids.append(rid)
 
@@ -275,77 +336,53 @@ class Query:
                 rid = int(rid)
                 if self.table.is_deleted_rid(rid):
                     continue
-
-                # read all columns at that version
-                cols = self.table.read_relative_user_columns(rid, steps_back)
-
+                versioned = self.table.read_relative_user_columns(rid, steps_back)
                 projected: List[Optional[int]] = [None] * self._num_cols
                 for i, take in enumerate(query_columns):
                     if take:
-                        projected[i] = int(cols[i])
-
-                pk = int(cols[self._key_col])
+                        projected[i] = int(versioned[i])
+                pk = int(versioned[self._key_col])
                 out.append(Record(rid, pk, projected))
             return out
         except Exception:
             return []
 
-    # ---- SUM VERSION (sum over a past version) ----
-
-    def sum_version(self, start_range: int, end_range: int, aggregate_column_index: int, relative_version: int) -> int:
-        """Like sum but uses historical values instead of the latest."""
+    def sum_version(self, start_range: int, end_range: int, aggregate_column_index: int, relative_version: int):
         try:
             start_k = int(start_range)
             end_k = int(end_range)
             if start_k > end_k:
                 start_k, end_k = end_k, start_k
             c = int(aggregate_column_index)
+            steps_back = abs(int(relative_version))
 
-            record_found = False
             total = 0
-            # go through each key in the range and look up its historical version
-            for i in range(start_k, end_k + 1):
-                record = self.select_version(i, self._key_col, [1] * self._num_cols, int(relative_version))
-                if not record:
+            found = False
+            if self.table.index.is_indexed(self._key_col):
+                rids = self.table.index.locate_range(start_k, end_k, self._key_col)
+            else:
+                rids = self.table.all_base_rids()
+
+            for rid in rids:
+                rid = int(rid)
+                if self.table.is_deleted_rid(rid):
                     continue
-                record_found = True
-                total += int(record[0].columns[c])
-            if not record_found:
-                return False
-            return int(total)
+                pk = int(self.table.read_latest_user_value(rid, self._key_col))
+                if start_k <= pk <= end_k:
+                    total += int(self.table.read_relative_user_value(rid, c, steps_back))
+                    found = True
+            return int(total) if found else False
         except Exception:
             return 0
 
-    # ---- INCREMENT ----
-
     def increment(self, key: int, column: int) -> bool:
-        """Bump a column's value by 1. Basically just a shortcut for update."""
         try:
-            k = int(key)
-            base_rid = self.table.key2rid.get(k)
-            if base_rid is None:
+            recs = self.select(int(key), self._key_col, [1] * self._num_cols)
+            if not recs:
                 return False
-            base_rid = int(base_rid)
-            if self.table.is_deleted_rid(base_rid):
-                return False
-
-            col = int(column)
-            if col < 0 or col >= self._num_cols:
-                return False
-
-            old_row = self.table.read_latest_user_columns(base_rid)
-
-            # read current value, add 1, write it back as a normal update
-            cur = int(old_row[col])
-            cols = [None] * self._num_cols
-            cols[col] = cur + 1
-
-            self.table.apply_update(base_rid, cols, prev_latest=old_row)
-
-            new_row = list(old_row)
-            new_row[col] = int(cur + 1)
-            self.table.index.update_entry(base_rid, old_row, new_row)
-
-            return True
+            curr = recs[0].columns
+            updated = [None] * self._num_cols
+            updated[int(column)] = int(curr[int(column)]) + 1
+            return bool(self.update(int(key), *updated))
         except Exception:
             return False
