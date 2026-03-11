@@ -5,13 +5,7 @@ from lstore.lock_manager import LockConflict
 
 
 class Query:
-    """
-    Entry point for all database operations -- insert, delete, update, select, etc.
-    In Milestone 3:
-      - write locks are managed by Transaction
-      - read locks are acquired here on actual accessed RID(s)
-      - strict 2PL / no-wait conflicts must raise LockConflict in txn path
-    """
+
 
     def __init__(self, table: Table):
         self.table = table
