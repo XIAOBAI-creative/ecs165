@@ -5,7 +5,13 @@ from lstore.lock_manager import LockConflict
 
 
 class Query:
-
+    """
+    Entry point for all database operations -- insert, delete, update, select, etc.
+    In Milestone 3:
+      - write locks are managed by Transaction
+      - read locks are acquired here on actual accessed RID(s)
+      - strict 2PL / no-wait conflicts must raise LockConflict in txn path
+    """
 
     def __init__(self, table: Table):
         self.table = table
@@ -15,41 +21,29 @@ class Query:
     def _acquire_shared_if_needed(self, txn, rid: int) -> bool:
         if txn is None:
             return True
-
         txn_id = getattr(txn, "txn_id", None)
         if txn_id is None:
             return True
-
         lm = getattr(self.table, "lock_manager", None)
         if lm is None:
             return True
-
         lm.acquire_S(int(txn_id), ("RID", self.table.name, int(rid)))
         return True
 
     def _acquire_insert_rid_x_if_needed(self, txn, rid: int) -> bool:
         if txn is None:
             return True
-
         txn_id = getattr(txn, "txn_id", None)
         if txn_id is None:
             return True
-
         lm = getattr(self.table, "lock_manager", None)
         if lm is None:
             return True
-
         lm.acquire_X(int(txn_id), ("RID", self.table.name, int(rid)))
         return True
 
-    def _rollback_insert_local(
-        self,
-        base_rid: int,
-        row: List[int],
-        old_existing: Optional[int] = None,
-    ) -> None:
+    def _rollback_insert_local(self, base_rid: int, row: List[int], old_existing: Optional[int] = None) -> None:
         pk = int(row[self._key_col])
-
         with self.table._meta_lock:
             self.table._deleted[int(base_rid)] = True
             self.table._latest_cache.pop(int(base_rid), None)
@@ -61,7 +55,6 @@ class Query:
                     self.table.key2rid[pk] = int(old_existing)
 
             self.table.page_directory.pop(int(base_rid), None)
-
             try:
                 self.table._base_rid_list.remove(int(base_rid))
             except ValueError:
@@ -73,7 +66,6 @@ class Query:
 
     def _rollback_delete_local(self, base_rid: int, old_row: List[int], old_deleted: bool) -> None:
         pk = int(old_row[self._key_col])
-
         with self.table._meta_lock:
             self.table._deleted[int(base_rid)] = bool(old_deleted)
             if old_deleted:
@@ -84,39 +76,19 @@ class Query:
 
         if not old_deleted:
             for c in range(self._num_cols):
-                try:
-                    if self.table.index.is_indexed(c):
-                        self.table.index.insert_entry(c, int(old_row[c]), int(base_rid))
-                except Exception:
-                    pass
+                if self.table.index.is_indexed(c):
+                    self.table.index.insert_entry(c, int(old_row[c]), int(base_rid))
 
-    def _rollback_update_local(
-        self,
-        base_rid: int,
-        old_row: List[int],
-        old_indirection: int,
-        old_schema: int,
-        new_row: Optional[List[int]] = None,
-    ) -> None:
-        try:
-            new_tail = int(self.table._base_latest_tail_rid(base_rid))
-        except Exception:
-            new_tail = 0
-
-        try:
-            self.table.overwrite_base_indirection(base_rid, int(old_indirection))
-        except Exception:
-            pass
-
-        try:
-            self.table.overwrite_base_schema(base_rid, int(old_schema))
-        except Exception:
-            pass
+    def _rollback_update_local(self, base_rid: int, old_row: List[int], old_indirection: int, old_schema: int, new_row: Optional[List[int]] = None) -> None:
+        new_tail = int(self.table._base_latest_tail_rid(base_rid))
+        self.table.overwrite_base_indirection(base_rid, int(old_indirection))
+        self.table.overwrite_base_schema(base_rid, int(old_schema))
 
         if new_tail != 0 and new_tail != int(old_indirection):
             with self.table._meta_lock:
                 self.table._deleted[int(new_tail)] = True
                 self.table._latest_cache.pop(int(new_tail), None)
+                self.table.page_directory.pop(int(new_tail), None)
 
         with self.table._meta_lock:
             if not bool(self.table._deleted.get(int(base_rid), False)):
@@ -160,11 +132,8 @@ class Query:
         except Exception:
             if txn is not None:
                 raise
-            try:
-                if "base_rid" in locals() and "old_row" in locals():
-                    self._rollback_delete_local(int(base_rid), list(old_row), bool(old_deleted))
-            except Exception:
-                pass
+            if "base_rid" in locals() and "old_row" in locals():
+                self._rollback_delete_local(int(base_rid), list(old_row), bool(old_deleted))
             return False
 
     def insert(self, *columns, txn=None):
@@ -200,15 +169,8 @@ class Query:
         except Exception:
             if txn is not None:
                 raise
-            try:
-                if "base_rid" in locals() and "row" in locals():
-                    self._rollback_insert_local(
-                        int(base_rid),
-                        list(row),
-                        old_existing if "old_existing" in locals() else None,
-                    )
-            except Exception:
-                pass
+            if "base_rid" in locals() and "row" in locals():
+                self._rollback_insert_local(int(base_rid), list(row), old_existing if "old_existing" in locals() else None)
             return False
 
     def select(self, key: int, column: int, query_columns: List[int], txn=None):
@@ -285,17 +247,14 @@ class Query:
         except Exception:
             if txn is not None:
                 raise
-            try:
-                if "base_rid" in locals() and "old_row" in locals():
-                    self._rollback_update_local(
-                        int(base_rid),
-                        [int(v) for v in old_row],
-                        int(old_indirection) if "old_indirection" in locals() else 0,
-                        int(old_schema) if "old_schema" in locals() else 0,
-                        new_row if "new_row" in locals() else None,
-                    )
-            except Exception:
-                pass
+            if "base_rid" in locals() and "old_row" in locals():
+                self._rollback_update_local(
+                    int(base_rid),
+                    [int(v) for v in old_row],
+                    int(old_indirection) if "old_indirection" in locals() else 0,
+                    int(old_schema) if "old_schema" in locals() else 0,
+                    new_row if "new_row" in locals() else None,
+                )
             return False
 
     def sum(self, start_range: int, end_range: int, aggregate_column_index: int, txn=None):
