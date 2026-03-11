@@ -304,14 +304,7 @@ class Transaction:
             else:
                 result = op(*args)
 
-            # 基本失败：False / None
             if result is False or result is None:
-                self._last_abort_reason = "QUERY_FAIL"
-                return self.abort()
-
-            # 关键补丁：事务里的 select 查不到，也视为失败
-            # 只对 select 生效，不碰 sum，避免把 sum=0 之类场景误伤
-            if op_name == "select" and isinstance(result, list) and len(result) == 0:
                 self._last_abort_reason = "QUERY_FAIL"
                 return self.abort()
 
