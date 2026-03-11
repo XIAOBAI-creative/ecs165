@@ -32,10 +32,8 @@ class Transaction:
     def __init__(self):
         self.queries: List[Tuple[Callable[..., Any], Table, Tuple[Any, ...]]] = []
         self.txn_id: int = _next_txn_id()
-
         self.table: Optional[Table] = None
         self.lm: Optional[LockManager] = None
-
         self._undo: List[UndoEntry] = []
         self._last_abort_reason: Optional[str] = None
 
@@ -72,7 +70,6 @@ class Transaction:
 
             row = [int(x) for x in args]
             pk = int(row[table.key])
-
             old_existing = table.key2rid.get(pk)
 
             return UndoEntry(
@@ -270,7 +267,6 @@ class Transaction:
         if name == "insert":
             if len(args) <= table.key:
                 return
-
             pk = int(args[table.key])
             lm.acquire_X(self.txn_id, ("PK", table.name, pk))
             return
@@ -278,10 +274,8 @@ class Transaction:
         if name in ("update", "delete", "increment"):
             if len(args) < 1:
                 return
-
             pk = int(args[0])
 
-            # 固定顺序：先 PK 再 RID，避免顺序不一致
             lm.acquire_X(self.txn_id, ("PK", table.name, pk))
 
             base_rid = table.get_base_rid_by_key(pk)
@@ -304,7 +298,6 @@ class Transaction:
                     self._undo.append(undo)
 
             op_name = getattr(op, "__name__", "")
-
             if op_name in ("insert", "update", "delete", "select", "sum", "increment"):
                 result = op(*args, txn=self)
             else:
@@ -316,11 +309,11 @@ class Transaction:
 
             if undo is not None and undo.typ == "INSERT":
                 if isinstance(result, tuple):
-                    ok, rid = result
+                    ok, new_rid = result
                     if not ok:
                         self._last_abort_reason = "QUERY_FAIL"
                         return self.abort()
-                    undo.base_rid = int(rid)
+                    undo.base_rid = int(new_rid)
                 else:
                     pk = int(undo.payload["pk"])
                     real_rid = table.get_base_rid_by_key(pk)
