@@ -6,11 +6,11 @@ from lstore.lock_manager import LockConflict
 
 class Query:
     """
-    数据库对外查询接口。
-    M3 中：
-    - 写锁主要由 Transaction 负责
-    - 读路径在这里对实际访问 RID 加 S 锁
-    - strict 2PL + no-wait 冲突时抛出 LockConflict
+    Entry point for all database operations -- insert, delete, update, select, etc.
+    In Milestone 3:
+      - write locks are managed by Transaction
+      - read locks are acquired here on actual accessed RID(s)
+      - strict 2PL / no-wait conflicts must raise LockConflict in txn path
     """
 
     def __init__(self, table: Table):
@@ -47,10 +47,6 @@ class Query:
 
         lm.acquire_X(int(txn_id), ("RID", self.table.name, int(rid)))
         return True
-
-    # -------------------------
-    # statement-local rollback helpers
-    # -------------------------
 
     def _rollback_insert_local(
         self,
@@ -147,10 +143,6 @@ class Query:
                 except Exception:
                     pass
 
-    # -------------------------
-    # DELETE
-    # -------------------------
-
     def delete(self, primary_key: int, txn=None) -> bool:
         try:
             pk = int(primary_key)
@@ -159,7 +151,6 @@ class Query:
                 return False
 
             base_rid = int(base_rid)
-
             old_row = self.table.read_latest_user_columns(base_rid)
             with self.table._meta_lock:
                 old_deleted = bool(self.table._deleted.get(base_rid, False))
@@ -186,10 +177,6 @@ class Query:
                 pass
             return False
 
-    # -------------------------
-    # INSERT
-    # -------------------------
-
     def insert(self, *columns, txn=None):
         try:
             if len(columns) != self._num_cols:
@@ -207,11 +194,7 @@ class Query:
                 return False
 
             base_rid = self.table.alloc_base_rid()
-
-            # 关键修复：
-            # 事务插入路径里，先把新 RID 锁住，再把记录发布到 page_directory / index / key2rid
             self._acquire_insert_rid_x_if_needed(txn, int(base_rid))
-
             self.table.write_base_record(base_rid, row)
 
             for c in range(self._num_cols):
@@ -236,15 +219,10 @@ class Query:
                 pass
             return False
 
-    # -------------------------
-    # SELECT (latest version)
-    # -------------------------
-
     def select(self, key: int, column: int, query_columns: List[int], txn=None):
         try:
             search_col = int(column)
             search_val = int(key)
-
             use_index = self.table.index.is_indexed(search_col)
 
             if use_index:
@@ -253,19 +231,14 @@ class Query:
                 rids = self.table.all_base_rids()
 
             out: List[Record] = []
-
             for rid in rids:
                 rid = int(rid)
-
-                # 先加 S 锁，再判断 deleted / 读取内容
-                # 这样未提交 insert / update / delete 都不会被读到
                 self._acquire_shared_if_needed(txn, rid)
 
                 if self.table.is_deleted_rid(rid):
                     continue
 
                 latest = self.table.read_latest_user_columns(rid)
-
                 if int(latest[search_col]) != search_val:
                     continue
 
@@ -286,10 +259,6 @@ class Query:
                 return False
             return []
 
-    # -------------------------
-    # UPDATE
-    # -------------------------
-
     def update(self, key: int, *columns, txn=None) -> bool:
         try:
             if len(columns) != self._num_cols:
@@ -303,7 +272,6 @@ class Query:
                 return False
 
             base_rid = int(base_rid)
-
             cols: List[Optional[int]] = list(columns)
             old_row = self.table.read_latest_user_columns(base_rid)
             old_indirection = int(self.table._base_latest_tail_rid(base_rid))
@@ -317,7 +285,6 @@ class Query:
                     new_row[i] = int(v)
 
             self.table.index.update_entry(base_rid, old_row, new_row)
-
             return True
 
         except LockConflict:
@@ -336,10 +303,6 @@ class Query:
                 pass
             return False
 
-    # -------------------------
-    # SUM (latest version)
-    # -------------------------
-
     def sum(self, start_range: int, end_range: int, aggregate_column_index: int, txn=None):
         try:
             start_k = int(start_range)
@@ -350,7 +313,6 @@ class Query:
             c = int(aggregate_column_index)
             total = 0
             record_found = False
-
             use_index = self.table.index.is_indexed(self._key_col)
 
             if use_index:
@@ -360,8 +322,6 @@ class Query:
 
             for rid in rids:
                 rid = int(rid)
-
-                # 同样先拿 S 锁
                 self._acquire_shared_if_needed(txn, rid)
 
                 if self.table.is_deleted_rid(rid):
@@ -381,10 +341,6 @@ class Query:
                 return False
             return 0
 
-    # -------------------------
-    # VERSIONED READS
-    # -------------------------
-
     def select_version(self, key: int, column: int, query_columns: List[int], relative_version: int):
         try:
             search_col = int(column)
@@ -394,17 +350,21 @@ class Query:
             if self.table.index.is_indexed(search_col):
                 rids = self.table.index.locate(search_col, search_val)
             else:
-                rids = self.table.all_base_rids()
+                rids = []
+                for rid in self.table.all_base_rids():
+                    rid = int(rid)
+                    if self.table.is_deleted_rid(rid):
+                        continue
+                    v = self.table.read_latest_user_value(rid, search_col)
+                    if int(v) == search_val:
+                        rids.append(rid)
 
             out: List[Record] = []
             for rid in rids:
                 rid = int(rid)
                 if self.table.is_deleted_rid(rid):
                     continue
-
                 versioned = self.table.read_relative_user_columns(rid, steps_back)
-                if int(versioned[search_col]) != search_val:
-                    continue
 
                 projected: List[Optional[int]] = [None] * self._num_cols
                 for i, take in enumerate(query_columns):
@@ -425,7 +385,6 @@ class Query:
             end_k = int(end_range)
             if start_k > end_k:
                 start_k, end_k = end_k, start_k
-
             c = int(aggregate_column_index)
             steps_back = abs(int(relative_version))
 
@@ -451,10 +410,6 @@ class Query:
 
         except Exception:
             return 0
-
-    # -------------------------
-    # INCREMENT
-    # -------------------------
 
     def increment(self, key: int, column: int, txn=None) -> bool:
         try:
