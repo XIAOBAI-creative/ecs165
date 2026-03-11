@@ -28,6 +28,14 @@ class Internal:
         return False
 
 class BPlusTree:
+    """
+    B+Tree supporting so far:
+      - insert(key, rid)
+      - find(key) -> list[rid]
+      - range(begin, end) -> list[rid]
+    order = max number of keys in a node before split
+    """
+
     def __init__(self, order: int = 32):
         if order < 3:
             raise ValueError("order must be >= 3")
@@ -90,8 +98,7 @@ class BPlusTree:
         leaf: Leaf = node
         i = bisect_left(leaf.keys, key)
         if i < len(leaf.keys) and leaf.keys[i] == key:
-            if rid not in leaf.vals[i]:
-                leaf.vals[i].append(rid)
+            leaf.vals[i].append(rid)
         else:
             leaf.keys.insert(i, key)
             leaf.vals.insert(i, [rid])
