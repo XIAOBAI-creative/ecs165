@@ -21,29 +21,41 @@ class Query:
     def _acquire_shared_if_needed(self, txn, rid: int) -> bool:
         if txn is None:
             return True
+
         txn_id = getattr(txn, "txn_id", None)
         if txn_id is None:
             return True
+
         lm = getattr(self.table, "lock_manager", None)
         if lm is None:
             return True
+
         lm.acquire_S(int(txn_id), ("RID", self.table.name, int(rid)))
         return True
 
     def _acquire_insert_rid_x_if_needed(self, txn, rid: int) -> bool:
         if txn is None:
             return True
+
         txn_id = getattr(txn, "txn_id", None)
         if txn_id is None:
             return True
+
         lm = getattr(self.table, "lock_manager", None)
         if lm is None:
             return True
+
         lm.acquire_X(int(txn_id), ("RID", self.table.name, int(rid)))
         return True
 
-    def _rollback_insert_local(self, base_rid: int, row: List[int], old_existing: Optional[int] = None) -> None:
+    def _rollback_insert_local(
+        self,
+        base_rid: int,
+        row: List[int],
+        old_existing: Optional[int] = None,
+    ) -> None:
         pk = int(row[self._key_col])
+
         with self.table._meta_lock:
             self.table._deleted[int(base_rid)] = True
             self.table._latest_cache.pop(int(base_rid), None)
@@ -55,6 +67,7 @@ class Query:
                     self.table.key2rid[pk] = int(old_existing)
 
             self.table.page_directory.pop(int(base_rid), None)
+
             try:
                 self.table._base_rid_list.remove(int(base_rid))
             except ValueError:
@@ -66,6 +79,7 @@ class Query:
 
     def _rollback_delete_local(self, base_rid: int, old_row: List[int], old_deleted: bool) -> None:
         pk = int(old_row[self._key_col])
+
         with self.table._meta_lock:
             self.table._deleted[int(base_rid)] = bool(old_deleted)
             if old_deleted:
@@ -79,8 +93,16 @@ class Query:
                 if self.table.index.is_indexed(c):
                     self.table.index.insert_entry(c, int(old_row[c]), int(base_rid))
 
-    def _rollback_update_local(self, base_rid: int, old_row: List[int], old_indirection: int, old_schema: int, new_row: Optional[List[int]] = None) -> None:
+    def _rollback_update_local(
+        self,
+        base_rid: int,
+        old_row: List[int],
+        old_indirection: int,
+        old_schema: int,
+        new_row: Optional[List[int]] = None,
+    ) -> None:
         new_tail = int(self.table._base_latest_tail_rid(base_rid))
+
         self.table.overwrite_base_indirection(base_rid, int(old_indirection))
         self.table.overwrite_base_schema(base_rid, int(old_schema))
 
@@ -170,7 +192,11 @@ class Query:
             if txn is not None:
                 raise
             if "base_rid" in locals() and "row" in locals():
-                self._rollback_insert_local(int(base_rid), list(row), old_existing if "old_existing" in locals() else None)
+                self._rollback_insert_local(
+                    int(base_rid),
+                    list(row),
+                    old_existing if "old_existing" in locals() else None,
+                )
             return False
 
     def select(self, key: int, column: int, query_columns: List[int], txn=None):
