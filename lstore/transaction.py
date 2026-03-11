@@ -94,17 +94,16 @@ class Transaction:
 
             base_rid = int(base_rid)
             old_row = table.read_latest_user_columns(base_rid)
-            old_indirection = int(table._base_latest_tail_rid(base_rid))
-            old_schema = int(table._base_schema(base_rid))
-
+            # old_indirection/old_schema 将在操作执行后从 apply_update 返回值里填充
+            # 这里先用占位符 -1，_run_once 会在操作后更新
             return UndoEntry(
                 typ="UPDATE",
                 table=table,
                 base_rid=base_rid,
                 payload={
                     "old_row": [int(v) for v in old_row],
-                    "old_indirection": old_indirection,
-                    "old_schema": old_schema,
+                    "old_indirection": -1,  # 将在 _run_once 中填充
+                    "old_schema": -1,       # 将在 _run_once 中填充
                 },
             )
 
@@ -251,6 +250,28 @@ class Transaction:
                         pass
             return
 
+    def _acquire_read_locks_for_op(
+        self,
+        table: Table,
+        op: Callable[..., Any],
+        args: Tuple[Any, ...],
+    ) -> None:
+        """为 select 等读操作获取 S 锁（strict 2PL）"""
+        lm = getattr(table, "lock_manager", None)
+        if lm is None:
+            setattr(table, "lock_manager", LockManager())
+            lm = getattr(table, "lock_manager")
+
+        name = getattr(op, "__name__", "")
+        if name == "select":
+            if len(args) < 1:
+                return
+            pk = int(args[0])
+            lm.acquire_S(self.txn_id, ("PK", table.name, pk))
+            base_rid = table.get_base_rid_by_key(pk)
+            if base_rid is not None:
+                lm.acquire_S(self.txn_id, ("RID", table.name, int(base_rid)))
+
     def _acquire_write_locks_for_op(
         self,
         table: Table,
@@ -288,8 +309,12 @@ class Transaction:
         self._last_abort_reason = None
 
         for (op, table, args) in self.queries:
+            op_name = getattr(op, "__name__", "")
+
             if self._is_write_op(op):
                 self._acquire_write_locks_for_op(table, op, args)
+            elif op_name == "select":
+                self._acquire_read_locks_for_op(table, op, args)
 
             undo = None
             if self._is_write_op(op):
@@ -303,15 +328,21 @@ class Transaction:
             else:
                 result = op(*args)
 
-            # 普通失败
-            if result is False or result is None:
-                self._last_abort_reason = "QUERY_FAIL"
+            if result is False:
+                # increment가 실패하는 경우는 락 경쟁일 가능성이 높으므로 LOCK으로 처리
+                if op_name == "increment":
+                    self._last_abort_reason = "LOCK"
+                else:
+                    self._last_abort_reason = "QUERY_FAIL"
                 return self.abort()
 
-            # 关键修复：事务里的 select 查不到，也算失败
-            if op_name == "select" and not result:
-                self._last_abort_reason = "QUERY_FAIL"
-                return self.abort()
+            # 对 update/increment：从 apply_update 返回值填充 undo 里的 old_indirection/old_schema
+            if undo is not None and undo.typ == "UPDATE":
+                if isinstance(result, tuple) and len(result) == 4:
+                    # apply_update 返回 (tail_rid, old_indirection, old_schema, old_row)
+                    _, old_ind, old_sch, _ = result
+                    undo.payload["old_indirection"] = int(old_ind)
+                    undo.payload["old_schema"] = int(old_sch)
 
             if undo is not None and undo.typ == "INSERT":
                 if isinstance(result, tuple):

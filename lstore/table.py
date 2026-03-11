@@ -186,6 +186,10 @@ class Table:
 
         self._meta_lock = threading.RLock()
 
+        # 必须在 __init__ 里初始化，避免多线程 lazy init 时产生竞争
+        from lstore.lock_manager import LockManager
+        self.lock_manager = LockManager()
+
         self.buffer_pool = buffer_pool
         self._bp_lock: Optional[threading.RLock] = threading.RLock() if self.buffer_pool is not None else None
 
