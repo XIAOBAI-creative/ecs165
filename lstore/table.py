@@ -338,11 +338,10 @@ class Table:
                 raise KeyError("RID not found")
             pr = self.page_ranges[loc.page_range_id]
 
-        out = [0] * self.num_columns_total
-        for col in range(self.num_columns_total):
-            page = pr.get_page(loc.is_tail, col, loc.page_id)
-            out[col] = page.read(loc.offset)
-            pr.release_page(loc.is_tail, col, loc.page_id, dirty=False)
+        # 批量获取所有列的页，只需一次锁+bufferpool操作
+        pages = pr.get_pages_batch(loc.is_tail, loc.page_id, self.num_columns_total)
+        out = [int(pages[col].read(loc.offset)) for col in range(self.num_columns_total)]
+        pr.release_pages_batch(loc.is_tail, loc.page_id, self.num_columns_total, dirty=False)
         return out
 
     # -------------------------
@@ -368,6 +367,21 @@ class Table:
         with pr._lock:
             page = pr.get_page(False, SCHEMA_ENCODING_COLUMN, loc.page_id)
             page.overwrite(loc.offset, int(new_schema))
+            pr.release_page(False, SCHEMA_ENCODING_COLUMN, loc.page_id, dirty=True)
+
+    def overwrite_base_indirection_and_schema(self, base_rid: int, new_tail_rid: int, new_schema: int) -> None:
+        """一次拿锁同时写 INDIRECTION 和 SCHEMA，减少锁竞争"""
+        with self._meta_lock:
+            loc = self.page_directory[int(base_rid)]
+            if loc.is_tail:
+                raise ValueError("base_rid points to tail")
+            pr = self.page_ranges[loc.page_range_id]
+        with pr._lock:
+            p_ind = pr.get_page(False, INDIRECTION_COLUMN, loc.page_id)
+            p_ind.overwrite(loc.offset, int(new_tail_rid))
+            pr.release_page(False, INDIRECTION_COLUMN, loc.page_id, dirty=True)
+            p_sch = pr.get_page(False, SCHEMA_ENCODING_COLUMN, loc.page_id)
+            p_sch.overwrite(loc.offset, int(new_schema))
             pr.release_page(False, SCHEMA_ENCODING_COLUMN, loc.page_id, dirty=True)
 
     # -------------------------
@@ -415,6 +429,22 @@ class Table:
 
     def _base_schema(self, base_rid: int) -> int:
         return int(self._read_physical_column(base_rid, SCHEMA_ENCODING_COLUMN))
+
+    def _base_indirection_and_schema(self, base_rid: int):
+        """一次读 INDIRECTION 和 SCHEMA 两列，减少锁和 bufferpool 开销"""
+        with self._meta_lock:
+            loc = self.page_directory.get(int(base_rid))
+            if loc is None:
+                raise KeyError("RID not found")
+            pr = self.page_ranges[loc.page_range_id]
+        with pr._lock:
+            p_ind = pr.get_page(loc.is_tail, INDIRECTION_COLUMN, loc.page_id)
+            ind = int(p_ind.read(loc.offset))
+            pr.release_page(loc.is_tail, INDIRECTION_COLUMN, loc.page_id, dirty=False)
+            p_sch = pr.get_page(loc.is_tail, SCHEMA_ENCODING_COLUMN, loc.page_id)
+            sch = int(p_sch.read(loc.offset))
+            pr.release_page(loc.is_tail, SCHEMA_ENCODING_COLUMN, loc.page_id, dirty=False)
+        return ind, sch
 
     def read_base_user_value(self, base_rid: int, user_col: int) -> int:
         return int(self._read_physical_column(int(base_rid), HIDDEN_COLS + int(user_col)))
@@ -521,10 +551,25 @@ class Table:
     # Update apply
     # -------------------------
     def apply_update(self, base_rid: int, new_user_cols: List[Optional[int]], prev_latest: Optional[List[int]] = None) -> int:
-        if self.is_deleted_rid(base_rid):
-            raise KeyError("record deleted")
-        if len(new_user_cols) != self.num_columns:
-            raise ValueError("wrong number of columns")
+        br = int(base_rid)
+
+        # 1. 先在 _meta_lock 内一次性取出所有需要的元数据
+        with self._meta_lock:
+            if bool(self._deleted.get(br, False)):
+                raise KeyError("record deleted")
+            if len(new_user_cols) != self.num_columns:
+                raise ValueError("wrong number of columns")
+            cached = self._latest_cache.get(br) if prev_latest is None else None
+            loc_base = self.page_directory.get(br)
+            if loc_base is None or loc_base.is_tail:
+                raise KeyError("base rid not found in page directory")
+            pr = self.page_ranges[loc_base.page_range_id]
+            pr_id = loc_base.page_range_id
+            next_tail_rid = self._next_tail_rid
+            self._next_tail_rid -= 1
+
+        if prev_latest is None:
+            prev_latest = list(cached) if cached is not None else self.read_latest_user_columns(br)
 
         schema = 0
         for i, v in enumerate(new_user_cols):
@@ -533,54 +578,88 @@ class Table:
         if schema == 0:
             return 0
 
-        if prev_latest is None:
-            with self._meta_lock:
-                cached = self._latest_cache.get(int(base_rid))
-            if cached is not None:
-                prev_latest = list(cached)
-            else:
-                prev_latest = self.read_latest_user_columns(int(base_rid))
+        tail_rid = next_tail_rid
 
-        prev_tail = self._base_latest_tail_rid(base_rid)
-        tail_rid = self.alloc_tail_rid()
-
-        self.write_tail_record(
-            tail_rid=tail_rid,
-            base_rid=base_rid,
-            prev_tail_rid=prev_tail,
-            schema_encoding=schema,
-            user_columns=new_user_cols,
-        )
-
-        self.overwrite_base_indirection(base_rid, tail_rid)
-        base_schema = self._base_schema(base_rid)
-        self.overwrite_base_schema(base_rid, base_schema | schema)
-
-        new_latest = list(prev_latest)
-        for i, v in enumerate(new_user_cols):
-            if v is not None:
-                new_latest[i] = int(v)
-
-        with self._meta_lock:
-            if not bool(self._deleted.get(int(base_rid), False)):
-                self._latest_cache[int(base_rid)] = new_latest
-
-        pr_id = self._base_page_range_id(base_rid)
-        with self._meta_lock:
-            pr = self.page_ranges[pr_id]
+        # 2. 在 pr._lock 内一次性完成：读 indirection/schema + 写 tail record + 更新 base indirection/schema
         with pr._lock:
+            # 预计算 base 页的 pid（避免 4 次 _pid 调用）
+            base_pid_ind = pr._pid(False, INDIRECTION_COLUMN, loc_base.page_id)
+            base_pid_sch = pr._pid(False, SCHEMA_ENCODING_COLUMN, loc_base.page_id)
+
+            # 批量读 base 的 indirection 和 schema
+            base_meta_pages = pr.buffer_pool.fetch_many(
+                [base_pid_ind, base_pid_sch]
+            ) if pr.buffer_pool is not None else [
+                pr.base_pages[INDIRECTION_COLUMN][loc_base.page_id],
+                pr.base_pages[SCHEMA_ENCODING_COLUMN][loc_base.page_id],
+            ]
+            prev_tail = int(base_meta_pages[0].read(loc_base.offset))
+            base_schema = int(base_meta_pages[1].read(loc_base.offset))
+            if pr.buffer_pool is not None:
+                pr.buffer_pool.unpin_many([
+                    (base_pid_ind, False),
+                    (base_pid_sch, False),
+                ])
+
+            # 写 tail record
+            page_id, offset = pr.alloc_tail_slot()
+            full = [0] * self.num_columns_total
+            full[INDIRECTION_COLUMN] = int(prev_tail)
+            full[RID_COLUMN] = int(tail_rid)
+            full[TIMESTAMP_COLUMN] = 0
+            full[SCHEMA_ENCODING_COLUMN] = int(schema)
+            for i, v in enumerate(new_user_cols):
+                full[HIDDEN_COLS + i] = 0 if v is None else int(v)
+            pages = pr.get_pages_batch(True, page_id, self.num_columns_total)
+            for col in range(self.num_columns_total):
+                off = pages[col].write(full[col])
+                if off != offset:
+                    pr.release_pages_batch(True, page_id, self.num_columns_total, dirty=True)
+                    raise RuntimeError("Tail offset misalignment")
+            pr.release_pages_batch(True, page_id, self.num_columns_total, dirty=True)
+
+            # 批量写 base 的 indirection 和 schema
+            base_write_pages = pr.buffer_pool.fetch_many(
+                [base_pid_ind, base_pid_sch]
+            ) if pr.buffer_pool is not None else [
+                pr.base_pages[INDIRECTION_COLUMN][loc_base.page_id],
+                pr.base_pages[SCHEMA_ENCODING_COLUMN][loc_base.page_id],
+            ]
+            base_write_pages[0].overwrite(loc_base.offset, int(tail_rid))
+            base_write_pages[1].overwrite(loc_base.offset, int(base_schema | schema))
+            if pr.buffer_pool is not None:
+                pr.buffer_pool.unpin_many([
+                    (base_pid_ind, True),
+                    (base_pid_sch, True),
+                ])
+
             tail_pages_now = len(pr.tail_pages[0])
+
+        tail_loc = RecordLocator(pr_id, True, page_id, offset)
+
+        # 3. 在 _meta_lock 内一次性更新所有元数据
         with self._meta_lock:
+            self.page_directory[int(tail_rid)] = tail_loc
+            if not bool(self._deleted.get(br, False)):
+                new_latest = list(prev_latest)
+                for i, v in enumerate(new_user_cols):
+                    if v is not None:
+                        new_latest[i] = int(v)
+                self._latest_cache[br] = new_latest
+
             last = self._last_merge_tail_pages.get(pr_id, 0)
             should_trigger_merge = (
                 self.buffer_pool is not None
                 and (tail_pages_now - last) >= self.MERGE_TRIGGER_EVERY_N_TAIL_PAGES
             )
+            if should_trigger_merge:
+                self._last_merge_tail_pages[pr_id] = tail_pages_now
+
         if should_trigger_merge:
-            self._last_merge_tail_pages[pr_id] = tail_pages_now
             self.request_merge(pr_id)
 
-        return int(tail_rid)
+        # 返回 (tail_rid, prev_tail, base_schema, prev_latest) 供调用方构建 undo log，避免重复读
+        return int(tail_rid), int(prev_tail), int(base_schema), list(prev_latest)
 
     # =========================================================
     # Snapshot helpers（后台 merge 专用：直接读磁盘，不 pin / unpin）

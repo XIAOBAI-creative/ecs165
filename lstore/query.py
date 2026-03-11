@@ -274,10 +274,10 @@ class Query:
             base_rid = int(base_rid)
             cols: List[Optional[int]] = list(columns)
             old_row = self.table.read_latest_user_columns(base_rid)
-            old_indirection = int(self.table._base_latest_tail_rid(base_rid))
-            old_schema = int(self.table._base_schema(base_rid))
 
-            self.table.apply_update(base_rid, cols, prev_latest=old_row)
+            result = self.table.apply_update(base_rid, cols, prev_latest=old_row)
+            # apply_update 返回 (tail_rid, old_indirection, old_schema, old_row)
+            _, old_indirection, old_schema, _ = result
 
             new_row = list(old_row)
             for i, v in enumerate(cols):
@@ -285,6 +285,9 @@ class Query:
                     new_row[i] = int(v)
 
             self.table.index.update_entry(base_rid, old_row, new_row)
+            # 带事务时返回完整 tuple 供 transaction 构建 undo log
+            if txn is not None:
+                return result
             return True
 
         except LockConflict:
@@ -295,8 +298,8 @@ class Query:
                     self._rollback_update_local(
                         int(base_rid),
                         [int(v) for v in old_row],
-                        int(old_indirection),
-                        int(old_schema),
+                        int(old_indirection) if "old_indirection" in locals() else 0,
+                        int(old_schema) if "old_schema" in locals() else 0,
                         new_row if "new_row" in locals() else None,
                     )
             except Exception:

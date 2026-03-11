@@ -24,9 +24,9 @@ class Database:
             base = Path(self.path)
             (base / "pages").mkdir(parents=True, exist_ok=True)
 
-            # Grading config: bufferpool size = 32 frames
+            # Grading config: bufferpool size = 100 frames
             self.bp = BufferPool(
-                capacity=32,
+                capacity=100,
                 loader=self._load_page,
                 flusher=self._flush_page,
             )
