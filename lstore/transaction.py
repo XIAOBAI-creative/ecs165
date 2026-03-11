@@ -151,6 +151,7 @@ class Transaction:
             old_existing = undo.payload.get("old_existing", None)
 
             with self._meta_guard(t):
+                # aborted insert 必须逻辑上不可见
                 t._deleted[base_rid] = True
                 t._latest_cache.pop(base_rid, None)
 
@@ -208,6 +209,7 @@ class Transaction:
             t.overwrite_base_indirection(base_rid, old_indirection)
             t.overwrite_base_schema(base_rid, old_schema)
 
+            # abort 后新 tail 必须作废并标 deleted
             if new_tail != 0 and new_tail != old_indirection:
                 with self._meta_guard(t):
                     t._deleted[int(new_tail)] = True
@@ -333,6 +335,7 @@ class Transaction:
     def abort(self) -> bool:
         try:
             for i in range(len(self._undo) - 1, -1, -1):
+                # 不再吞异常
                 self._apply_undo(self._undo[i])
         finally:
             self._release_all_locks()
