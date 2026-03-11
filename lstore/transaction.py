@@ -32,8 +32,10 @@ class Transaction:
     def __init__(self):
         self.queries: List[Tuple[Callable[..., Any], Table, Tuple[Any, ...]]] = []
         self.txn_id: int = _next_txn_id()
+
         self.table: Optional[Table] = None
         self.lm: Optional[LockManager] = None
+
         self._undo: List[UndoEntry] = []
         self._last_abort_reason: Optional[str] = None
 
@@ -57,16 +59,22 @@ class Transaction:
         return lock
 
     def _capture_before_write(
-        self, table: Table, op: Callable[..., Any], args: Tuple[Any, ...]
+        self,
+        table: Table,
+        op: Callable[..., Any],
+        args: Tuple[Any, ...],
     ) -> Optional[UndoEntry]:
         name = getattr(op, "__name__", "")
 
         if name == "insert":
             if len(args) != table.num_columns:
                 return None
+
             row = [int(x) for x in args]
             pk = int(row[table.key])
+
             old_existing = table.key2rid.get(pk)
+
             return UndoEntry(
                 typ="INSERT",
                 table=table,
@@ -81,15 +89,17 @@ class Transaction:
         if name in ("update", "increment"):
             if len(args) < 1:
                 return None
+
             pk = int(args[0])
             base_rid = table.get_base_rid_by_key(pk)
             if base_rid is None:
                 return None
-            base_rid = int(base_rid)
 
+            base_rid = int(base_rid)
             old_row = table.read_latest_user_columns(base_rid)
             old_indirection = int(table._base_latest_tail_rid(base_rid))
             old_schema = int(table._base_schema(base_rid))
+
             return UndoEntry(
                 typ="UPDATE",
                 table=table,
@@ -104,14 +114,18 @@ class Transaction:
         if name == "delete":
             if len(args) < 1:
                 return None
+
             pk = int(args[0])
             base_rid = table.get_base_rid_by_key(pk)
             if base_rid is None:
                 return None
+
             base_rid = int(base_rid)
             old_row = table.read_latest_user_columns(base_rid)
+
             with self._meta_guard(table):
                 old_deleted = bool(table._deleted.get(base_rid, False))
+
             return UndoEntry(
                 typ="DELETE",
                 table=table,
@@ -256,6 +270,7 @@ class Transaction:
         if name == "insert":
             if len(args) <= table.key:
                 return
+
             pk = int(args[table.key])
             lm.acquire_X(self.txn_id, ("PK", table.name, pk))
             return
@@ -263,18 +278,16 @@ class Transaction:
         if name in ("update", "delete", "increment"):
             if len(args) < 1:
                 return
+
             pk = int(args[0])
 
-            # lock order: PK -> RID
+            # 固定顺序：先 PK 再 RID，避免顺序不一致
             lm.acquire_X(self.txn_id, ("PK", table.name, pk))
 
             base_rid = table.get_base_rid_by_key(pk)
             if base_rid is not None:
                 lm.acquire_X(self.txn_id, ("RID", table.name, int(base_rid)))
             return
-
-        # select / sum don't pre-lock; Query acquires S on accessed RID(s)
-        return
 
     def _run_once(self) -> bool:
         self._undo.clear()
@@ -290,20 +303,31 @@ class Transaction:
                 if undo is not None:
                     self._undo.append(undo)
 
-            # transaction mode: always pass txn=self
-            result = op(*args, txn=self)
+            op_name = getattr(op, "__name__", "")
+
+            if op_name in ("insert", "update", "delete", "select", "sum", "increment"):
+                result = op(*args, txn=self)
+            else:
+                result = op(*args)
 
             if result is False:
                 self._last_abort_reason = "QUERY_FAIL"
                 return self.abort()
 
             if undo is not None and undo.typ == "INSERT":
-                pk = int(undo.payload["pk"])
-                real_rid = table.get_base_rid_by_key(pk)
-                if real_rid is None:
-                    self._last_abort_reason = "QUERY_FAIL"
-                    return self.abort()
-                undo.base_rid = int(real_rid)
+                if isinstance(result, tuple):
+                    ok, rid = result
+                    if not ok:
+                        self._last_abort_reason = "QUERY_FAIL"
+                        return self.abort()
+                    undo.base_rid = int(rid)
+                else:
+                    pk = int(undo.payload["pk"])
+                    real_rid = table.get_base_rid_by_key(pk)
+                    if real_rid is None:
+                        self._last_abort_reason = "QUERY_FAIL"
+                        return self.abort()
+                    undo.base_rid = int(real_rid)
 
         return self.commit()
 
