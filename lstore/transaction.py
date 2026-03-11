@@ -151,7 +151,6 @@ class Transaction:
             old_existing = undo.payload.get("old_existing", None)
 
             with self._meta_guard(t):
-                # aborted insert -> 逻辑上绝对不可见
                 t._deleted[base_rid] = True
                 t._latest_cache.pop(base_rid, None)
 
@@ -208,7 +207,6 @@ class Transaction:
             t.overwrite_base_indirection(base_rid, old_indirection)
             t.overwrite_base_schema(base_rid, old_schema)
 
-            # 新 tail 作废，必须标 deleted
             if new_tail != 0 and new_tail != old_indirection:
                 with self._meta_guard(t):
                     t._deleted[int(new_tail)] = True
@@ -226,8 +224,6 @@ class Transaction:
                         t.index.delete_entry(c, new_v, int(base_rid))
                         t.index.insert_entry(c, old_v, int(base_rid))
             return
-
-        raise ValueError(f"Unknown undo type: {undo.typ}")
 
     def _acquire_write_locks_for_op(
         self,
@@ -325,7 +321,6 @@ class Transaction:
     def abort(self) -> bool:
         try:
             for i in range(len(self._undo) - 1, -1, -1):
-                # 不再吞异常
                 self._apply_undo(self._undo[i])
         finally:
             released = set()
