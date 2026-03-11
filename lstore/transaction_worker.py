@@ -40,7 +40,9 @@ class TransactionWorker:
                     self._aborts += 1
                     attempts += 1
                     # FIX: Exponential backoff with cap to reduce livelock
-                    max_wait = min(0.002 * (2 ** attempts), 0.05)
+                    # 修复后
+                    capped = min(attempts, 6)  # 限制指数上限为6
+                    max_wait = min(0.002 * (2 ** capped), 0.05)
                     time.sleep(random.uniform(0.0005, max_wait))
 
         self.result = len(list(filter(lambda x: x, self.stats)))
