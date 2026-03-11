@@ -6,7 +6,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from bisect import bisect_left, bisect_right
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
+
 
 @dataclass
 class Leaf:
@@ -18,6 +19,7 @@ class Leaf:
     def is_leaf(self) -> bool:
         return True
 
+
 @dataclass
 class Internal:
     keys: List[int]
@@ -27,15 +29,8 @@ class Internal:
     def is_leaf(self) -> bool:
         return False
 
-class BPlusTree:
-    """
-    B+Tree supporting so far:
-      - insert(key, rid)
-      - find(key) -> list[rid]
-      - range(begin, end) -> list[rid]
-    order = max number of keys in a node before split
-    """
 
+class BPlusTree:
     def __init__(self, order: int = 32):
         if order < 3:
             raise ValueError("order must be >= 3")
@@ -98,7 +93,8 @@ class BPlusTree:
         leaf: Leaf = node
         i = bisect_left(leaf.keys, key)
         if i < len(leaf.keys) and leaf.keys[i] == key:
-            leaf.vals[i].append(rid)
+            if rid not in leaf.vals[i]:
+                leaf.vals[i].append(rid)
         else:
             leaf.keys.insert(i, key)
             leaf.vals.insert(i, [rid])
@@ -156,6 +152,7 @@ class BPlusTree:
                 break
             leaf = leaf.next
         return out
+
 
 class Index:
 
