@@ -151,6 +151,7 @@ class Transaction:
             old_existing = undo.payload.get("old_existing", None)
 
             with self._meta_guard(t):
+                # aborted insert -> 逻辑上绝对不可见
                 t._deleted[base_rid] = True
                 t._latest_cache.pop(base_rid, None)
 
@@ -161,6 +162,7 @@ class Transaction:
                         t.key2rid[pk] = int(old_existing)
 
                 t.page_directory.pop(base_rid, None)
+
                 if base_rid in t._base_rid_list:
                     t._base_rid_list.remove(base_rid)
 
@@ -206,11 +208,11 @@ class Transaction:
             t.overwrite_base_indirection(base_rid, old_indirection)
             t.overwrite_base_schema(base_rid, old_schema)
 
+            # 新 tail 作废，必须标 deleted
             if new_tail != 0 and new_tail != old_indirection:
                 with self._meta_guard(t):
                     t._deleted[int(new_tail)] = True
                     t._latest_cache.pop(int(new_tail), None)
-                    t.page_directory.pop(int(new_tail), None)
 
             with self._meta_guard(t):
                 if not bool(t._deleted.get(base_rid, False)):
@@ -258,14 +260,6 @@ class Transaction:
             if base_rid is not None:
                 lm.acquire_X(self.txn_id, ("RID", table.name, int(base_rid)))
             return
-
-    def _release_all_locks(self) -> None:
-        released = set()
-        for (_, table, _) in self.queries:
-            lm = getattr(table, "lock_manager", None)
-            if lm is not None and id(lm) not in released:
-                released.add(id(lm))
-                lm.release_all(self.txn_id)
 
     def reset_for_retry(self) -> None:
         self._undo.clear()
@@ -321,19 +315,32 @@ class Transaction:
             return bool(self._run_once())
         except LockConflict:
             self._last_abort_reason = "LOCK"
-            return self.abort()
+            self.abort()
+            return False
         except Exception:
             self._last_abort_reason = "EXCEPTION"
-            return self.abort()
+            self.abort()
+            return False
 
     def abort(self) -> bool:
         try:
             for i in range(len(self._undo) - 1, -1, -1):
+                # 不再吞异常
                 self._apply_undo(self._undo[i])
         finally:
-            self._release_all_locks()
+            released = set()
+            for (_, table, _) in self.queries:
+                lm = getattr(table, "lock_manager", None)
+                if lm is not None and id(lm) not in released:
+                    released.add(id(lm))
+                    lm.release_all(self.txn_id)
         return False
 
     def commit(self) -> bool:
-        self._release_all_locks()
+        released = set()
+        for (_, table, _) in self.queries:
+            lm = getattr(table, "lock_manager", None)
+            if lm is not None and id(lm) not in released:
+                released.add(id(lm))
+                lm.release_all(self.txn_id)
         return True
