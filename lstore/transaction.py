@@ -161,9 +161,10 @@ class Transaction:
                         t.key2rid[pk] = int(old_existing)
 
                 t.page_directory.pop(base_rid, None)
-
-                if base_rid in t._base_rid_list:
+                try:
                     t._base_rid_list.remove(base_rid)
+                except ValueError:
+                    pass
 
             for c in range(t.num_columns):
                 if t.index.is_indexed(c):
@@ -211,6 +212,7 @@ class Transaction:
                 with self._meta_guard(t):
                     t._deleted[int(new_tail)] = True
                     t._latest_cache.pop(int(new_tail), None)
+                    t.page_directory.pop(int(new_tail), None)
 
             with self._meta_guard(t):
                 if not bool(t._deleted.get(base_rid, False)):
@@ -224,6 +226,8 @@ class Transaction:
                         t.index.delete_entry(c, new_v, int(base_rid))
                         t.index.insert_entry(c, old_v, int(base_rid))
             return
+
+        raise ValueError(f"Unknown undo type: {undo.typ}")
 
     def _acquire_write_locks_for_op(
         self,
@@ -260,6 +264,14 @@ class Transaction:
     def reset_for_retry(self) -> None:
         self._undo.clear()
         self._last_abort_reason = None
+
+    def _release_all_locks(self) -> None:
+        released = set()
+        for (_, table, _) in self.queries:
+            lm = getattr(table, "lock_manager", None)
+            if lm is not None and id(lm) not in released:
+                released.add(id(lm))
+                lm.release_all(self.txn_id)
 
     def _run_once(self) -> bool:
         self._undo.clear()
@@ -323,19 +335,9 @@ class Transaction:
             for i in range(len(self._undo) - 1, -1, -1):
                 self._apply_undo(self._undo[i])
         finally:
-            released = set()
-            for (_, table, _) in self.queries:
-                lm = getattr(table, "lock_manager", None)
-                if lm is not None and id(lm) not in released:
-                    released.add(id(lm))
-                    lm.release_all(self.txn_id)
+            self._release_all_locks()
         return False
 
     def commit(self) -> bool:
-        released = set()
-        for (_, table, _) in self.queries:
-            lm = getattr(table, "lock_manager", None)
-            if lm is not None and id(lm) not in released:
-                released.add(id(lm))
-                lm.release_all(self.txn_id)
+        self._release_all_locks()
         return True
