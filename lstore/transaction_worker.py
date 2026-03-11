@@ -39,8 +39,10 @@ class TransactionWorker:
                 else:
                     self._aborts += 1
                     attempts += 1
-                    # Exponential backoff with hard cap on exponent to avoid OverflowError
-                    capped = min(attempts, 6)  # 2**6 = 64, max_wait = 0.002*64 = 0.128 -> capped to 0.05
+
+                    # 所有 abort 都重试，不只 LOCK
+                    # 同时限制指数上限，避免 overflow
+                    capped = min(attempts, 6)
                     max_wait = min(0.002 * (2 ** capped), 0.05)
                     time.sleep(random.uniform(0.0005, max_wait))
 
