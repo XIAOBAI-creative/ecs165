@@ -94,16 +94,17 @@ class Transaction:
 
             base_rid = int(base_rid)
             old_row = table.read_latest_user_columns(base_rid)
-            # old_indirection/old_schema 将在操作执行后从 apply_update 返回值里填充
-            # 这里先用占位符 -1，_run_once 会在操作后更新
+            old_indirection = int(table._base_latest_tail_rid(base_rid))
+            old_schema = int(table._base_schema(base_rid))
+
             return UndoEntry(
                 typ="UPDATE",
                 table=table,
                 base_rid=base_rid,
                 payload={
                     "old_row": [int(v) for v in old_row],
-                    "old_indirection": -1,  # 将在 _run_once 中填充
-                    "old_schema": -1,       # 将在 _run_once 中填充
+                    "old_indirection": old_indirection,
+                    "old_schema": old_schema,
                 },
             )
 
@@ -302,17 +303,15 @@ class Transaction:
             else:
                 result = op(*args)
 
-            if result is False:
+            # 普通失败
+            if result is False or result is None:
                 self._last_abort_reason = "QUERY_FAIL"
                 return self.abort()
 
-            # 对 update/increment：从 apply_update 返回值填充 undo 里的 old_indirection/old_schema
-            if undo is not None and undo.typ == "UPDATE":
-                if isinstance(result, tuple) and len(result) == 4:
-                    # apply_update 返回 (tail_rid, old_indirection, old_schema, old_row)
-                    _, old_ind, old_sch, _ = result
-                    undo.payload["old_indirection"] = int(old_ind)
-                    undo.payload["old_schema"] = int(old_sch)
+            # 关键修复：事务里的 select 查不到，也算失败
+            if op_name == "select" and not result:
+                self._last_abort_reason = "QUERY_FAIL"
+                return self.abort()
 
             if undo is not None and undo.typ == "INSERT":
                 if isinstance(result, tuple):
