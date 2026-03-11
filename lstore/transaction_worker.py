@@ -36,20 +36,21 @@ class TransactionWorker:
                     self.stats.append(True)
                     self._commits += 1
                     break
+                else:
+                    self._aborts += 1
+                    attempts += 1
 
-                self._aborts += 1
-                attempts += 1
-                reason = getattr(txn, "_last_abort_reason", None)
+                    reason = getattr(txn, "_last_abort_reason", None)
 
-                if reason != "LOCK":
-                    break
+                    if reason != "LOCK":
+                        break
 
-                capped = min(attempts, 6)
-                upper = min(0.002 * (2 ** capped), 0.05)
-                time.sleep(random.uniform(0.0005, upper))
+                    capped = min(attempts, 6)
+                    upper = min(0.002 * (2 ** capped), 0.05)
+                    time.sleep(random.uniform(0.0005, upper))
 
-                reset_fn = getattr(txn, "reset_for_retry", None)
-                if callable(reset_fn):
-                    reset_fn()
+                    reset_fn = getattr(txn, "reset_for_retry", None)
+                    if callable(reset_fn):
+                        reset_fn()
 
         self.result = len(list(filter(lambda x: x, self.stats)))
